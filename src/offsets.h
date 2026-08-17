@@ -25,7 +25,7 @@ namespace O {
     constexpr std::ptrdiff_t m_vecViewOffset = 0xE78;
     constexpr std::ptrdiff_t m_iIDEntIndex = 0x342C;   
 
-    // entity list (saját konstansok, nem változtak)
+    // entity list
     constexpr std::ptrdiff_t kListOffset = 0x10;
     constexpr std::ptrdiff_t kStride = 0x70;
     constexpr int kChunk = 512;
