@@ -107,7 +107,7 @@ Settings are stored in `config.ini`, located in the same folder as the injected 
 ## Credits
 
 - [ImGui](https://github.com/ocornut/imgui) – GUI library  
-- [Kiero](https://github.com/Rebzzel/kiero) – D3D11 hooking  
+- [Kiero](https://github.com/rdbo/ImGui-DirectX-11-Kiero-Hook) – D3D11 hooking  
 - [CS2-Dumper](https://github.com/a2x/cs2-dumper) - Dumping CS2 offsets
 - [CS2-SDK](https://www.cs2-sdk.com/) – CS2 SDK, some offsets come from there
 ---
