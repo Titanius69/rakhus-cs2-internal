@@ -1,19 +1,105 @@
-CMakeLists.txt.user
+# ==============================
+#  Build & output directories
+# ==============================
+out/
+build/
+cmake-build-*
+*.user
+*.userprefs
+CMakeUserPresets.json
+
+# ==============================
+#  CMake generated files
+# ==============================
 CMakeCache.txt
-CMakeFiles
-CMakeScripts
-Testing
+CMakeFiles/
+CMakeScripts/
+Testing/
 Makefile
 cmake_install.cmake
 install_manifest.txt
 compile_commands.json
 CTestTestfile.cmake
-_deps
-CMakeUserPresets.json
+_deps/
+CMakeLists.txt.user
+*.cmake
+!CMakeLists.txt
+!*.cmake.in
 
-# CLion
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#cmake-build-*
+# ==============================
+#  Visual Studio
+# ==============================
+.vs/
+*.sln
+*.vcxproj*
+*.vcxitems*
+*.filters
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.db
+*.opendb
+*.VC.db
+*.VC.VC.opendb
+*.pdb
+Debug/
+Release/
+x64/
+x86/
+Win32/
+*.obj
+*.exe
+*.dll
+*.lib
+*.exp
+*.ilk
+*.log
+*.tlog
+
+# ==============================
+#  JetBrains (CLion, etc.)
+# ==============================
+.idea/
+*.iml
+cmake-build-*
+
+# ==============================
+#  Visual Studio Code
+# ==============================
+.vscode/
+*.code-workspace
+
+# ==============================
+#  Compiled binaries / intermediate
+# ==============================
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.obj
+*.tlog
+*.lastbuildstate
+*.log
+*.manifest
+*.res
+*.dep
+
+# ==============================
+#  Miscellaneous
+# ==============================
+*.tmp
+*.bak
+*.swp
+*~
+*.swo
+*.orig
+*.rej
+.DS_Store
+Thumbs.db
