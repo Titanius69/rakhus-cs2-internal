@@ -1,6 +1,6 @@
 // ========================================================================
-// Rakhus CS2 Internal Cheat
-// Features: ESP, Aim Assist, NoFlash, Configurable settings via ImGui
+// Rakhus CS2 Internal Cheat – Optimized & Stable
+// Features: ESP, Smooth Aim Assist, NoFlash, Configurable ImGui Menu
 // Dependencies: ImGui, Kiero, D3D11, Windows SDK
 // ========================================================================
 
@@ -9,7 +9,6 @@
 #include <Psapi.h>
 #include <cstdint>
 #include <cstdio>
-#include <vector>
 #include <algorithm>
 #include <cmath>
 #include <thread>
@@ -29,6 +28,10 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 
+// -------------------- HEAD POSITION OFFSETS --------------------
+#define HEAD_OFFSET 2.5f           // Vertical offset above view offset
+#define HEAD_FORWARD_OFFSET 5.0f   // Forward offset in enemy's facing direction
+
 // -------------------- CONSOLE INITIALIZATION --------------------
 void InitConsole() {
     AllocConsole();
@@ -42,38 +45,42 @@ void InitConsole() {
 #define LOG_FMT(f, ...) printf(f, __VA_ARGS__)
 
 // -------------------- GLOBAL VARIABLES --------------------
-static uintptr_t g_pES = 0;           // Game Entity System pointer
-static uintptr_t hClient = 0;         // client.dll base address
-static bool g_bRunning = false;       // Indicates whether the main loop is active
-static int  g_frame = 0;              // Frame counter (unused)
-HMODULE g_hModule = nullptr;          // DLL module handle
-HWND g_gameHwnd = nullptr;            // Game window handle
+static uintptr_t g_pES = 0;
+static uintptr_t hClient = 0;
+static bool g_bRunning = false;
+HMODULE g_hModule = nullptr;
+HWND g_gameHwnd = nullptr;
 
-// D3D11 / ImGui resources
 ID3D11Device* g_pd3dDevice = nullptr;
 ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
 IDXGISwapChain* g_pSwapChain = nullptr;
 ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
 bool g_imGuiInitialized = false;
 
-// WndProc hook for ImGui input
 WNDPROC g_OriginalWndProc = nullptr;
 
-// -------------------- CONFIGURATION DEFAULTS --------------------
+// -------------------- AIM SMOOTHING STATE --------------------
+struct Vector3 { float x, y, z; };
+struct Vector2 { float x, y; };
+
+static Vector3 g_targetAngles = { 0, 0, 0 };
+static bool g_hasTarget = false;
+
+// -------------------- CONFIGURATION --------------------
 #define AIM_KEY_DEFAULT VK_F1
 #define AIM_RADIUS_DEFAULT 20.0f
 
 struct Config {
-    bool enabled = true;              // Master toggle for all features
+    bool enabled = true;
     float aimRadius = AIM_RADIUS_DEFAULT;
     int aimKey = AIM_KEY_DEFAULT;
     float espColorR = 0.0f;
     float espColorG = 0.75f;
     float espColorB = 1.0f;
-    bool showMenu = false;            // Whether the ImGui menu is visible
-    float smoothness = 0.8f;          // Aim smoothing factor (1.0 = instant, 0.0 = no correction)
-    bool noFlash = false;             // Disable flashbang effect
-    bool showDistance = true;         // Show distance to enemy
+    bool showMenu = false;
+    float smoothness = 0.8f;
+    bool noFlash = false;
+    bool showDistance = true;
 } g_config;
 
 // -------------------- CONFIG FILE I/O --------------------
@@ -135,10 +142,12 @@ void LoadConfig() {
 }
 
 // -------------------- HELPER FUNCTIONS --------------------
-// Basic validity check for pointers/addresses
-static bool IsValid(uintptr_t a) { return a > 0x10000 && a < 0x7FFFFFFFFFFF; }
+static bool IsValid(uintptr_t a) {
+    // Basic range check – does not guarantee the memory is readable,
+    // but avoids obviously invalid pointers.
+    return a > 0x10000 && a < 0x7FFFFFFFFFFF;
+}
 
-// Retrieve an entity's controller (CCSPlayerController) by index
 static uintptr_t GetEntity(int idx) {
     if (idx < 0 || !g_pES) return 0;
     uintptr_t chunk = *(uintptr_t*)(g_pES + O::kListOffset + (idx / O::kChunk) * 8);
@@ -149,21 +158,24 @@ static uintptr_t GetEntity(int idx) {
     return IsValid(ent) ? ent : 0;
 }
 
-// Convert a handle (e.g., m_hPlayerPawn) to the actual pawn pointer
 static uintptr_t HandleToEnt(uint32_t h) {
     if (!h || h == 0xFFFFFFFF) return 0;
     return GetEntity(h & 0x7FFF);
 }
 
-// Convenience getters for common entity properties
-static int  HP(uintptr_t e) { return IsValid(e) ? *(int*)(e + O::m_iHealth) : 0; }
-static int  Team(uintptr_t e) { return IsValid(e) ? *(uint8_t*)(e + O::m_iTeamNum) : 0; }
-static int  Life(uintptr_t e) { return IsValid(e) ? *(uint8_t*)(e + O::m_lifeState) : 0; }
+static int HP(uintptr_t e) {
+    if (!IsValid(e)) return 0;
+    return *(int*)(e + O::m_iHealth);
+}
+static int Team(uintptr_t e) {
+    if (!IsValid(e)) return 0;
+    return *(uint8_t*)(e + O::m_iTeamNum);
+}
+static int Life(uintptr_t e) {
+    if (!IsValid(e)) return 0;
+    return *(uint8_t*)(e + O::m_lifeState);
+}
 
-struct Vector3 { float x, y, z; };
-struct Vector2 { float x, y; };
-
-// Get the absolute origin (feet position) of a pawn
 static Vector3 GetOrigin(uintptr_t pawn) {
     Vector3 org{ 0,0,0 };
     if (!IsValid(pawn)) return org;
@@ -175,7 +187,6 @@ static Vector3 GetOrigin(uintptr_t pawn) {
     return org;
 }
 
-// Get the view offset (camera height) of a pawn
 static Vector3 GetViewOffset(uintptr_t pawn) {
     Vector3 off{ 0,0,0 };
     if (!IsValid(pawn)) return off;
@@ -185,9 +196,17 @@ static Vector3 GetViewOffset(uintptr_t pawn) {
     return off;
 }
 
+static Vector3 GetEyeAngles(uintptr_t pawn) {
+    Vector3 angles{ 0,0,0 };
+    if (!IsValid(pawn)) return angles;
+    angles.x = *(float*)(pawn + O::m_angEyeAngles);
+    angles.y = *(float*)(pawn + O::m_angEyeAngles + 4);
+    angles.z = *(float*)(pawn + O::m_angEyeAngles + 8);
+    return angles;
+}
+
 static float viewMatrix[16];
 
-// World-to-screen projection using the game's view matrix
 bool WorldToScreen(const Vector3& world, Vector2& screen, int screenW, int screenH) {
     float clipX = viewMatrix[0] * world.x + viewMatrix[1] * world.y + viewMatrix[2] * world.z + viewMatrix[3];
     float clipY = viewMatrix[4] * world.x + viewMatrix[5] * world.y + viewMatrix[6] * world.z + viewMatrix[7];
@@ -201,10 +220,10 @@ bool WorldToScreen(const Vector3& world, Vector2& screen, int screenW, int scree
     return true;
 }
 
-// -------------------- NOFLASH FEATURE --------------------
-// Resets all flashbang related values to zero, effectively nullifying the effect
+// -------------------- NOFLASH --------------------
 void DoNoFlash(uintptr_t localPawn) {
     if (!g_config.noFlash || !localPawn) return;
+    // Hardcoded offsets – update if game changes
     float* flashOverlayAlpha = (float*)(localPawn + 0x141C);
     float* flashMaxAlpha = (float*)(localPawn + 0x1424);
     float* flashDuration = (float*)(localPawn + 0x1428);
@@ -216,7 +235,6 @@ void DoNoFlash(uintptr_t localPawn) {
 }
 
 // -------------------- WNDPROC HOOK --------------------
-// Forward declaration of ImGui's WndProc handler
 extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -226,33 +244,80 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
     return CallWindowProc(g_OriginalWndProc, hWnd, msg, wParam, lParam);
 }
 
-// -------------------- AIM ASSIST (Smooth Aim) --------------------
-// Simple key state check (supports mouse buttons via virtual key codes)
-bool IsKeyDown(int key) {
-    if (key >= 0x01 && key <= 0x07) {
-        return (GetAsyncKeyState(key) & 0x8000) != 0;
+// -------------------- D3D11 RENDER TARGET MANAGEMENT --------------------
+bool CreateRenderTarget() {
+    if (!g_pSwapChain) return false;
+    ID3D11Texture2D* pBackBuffer = nullptr;
+    HRESULT hr = g_pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)&pBackBuffer);
+    if (FAILED(hr) || !pBackBuffer) return false;
+
+    // Release old render target view before creating a new one
+    if (g_mainRenderTargetView) {
+        g_mainRenderTargetView->Release();
+        g_mainRenderTargetView = nullptr;
     }
+
+    hr = g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
+    pBackBuffer->Release();
+    return SUCCEEDED(hr);
+}
+
+void CleanupRenderTarget() {
+    if (g_mainRenderTargetView) {
+        g_mainRenderTargetView->Release();
+        g_mainRenderTargetView = nullptr;
+    }
+}
+
+// -------------------- AIM ASSIST (OPTIMIZED) --------------------
+bool IsKeyDown(int key) {
     return (GetAsyncKeyState(key) & 0x8000) != 0;
 }
 
-// Main aim assist routine: finds the closest enemy to crosshair within the defined radius,
-// and smoothly adjusts view angles toward the enemy's head when the aim key is held.
+// Calculates the angles needed to look from source to target
+static Vector3 CalculateAngles(const Vector3& source, const Vector3& target) {
+    Vector3 delta = { target.x - source.x, target.y - source.y, target.z - source.z };
+    float dist = sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
+    if (dist < 1.0f) return { 0, 0, 0 };
+
+    Vector3 angles;
+    angles.x = -atan2(delta.z, sqrt(delta.x * delta.x + delta.y * delta.y)) * (180.0f / 3.14159265359f);
+    angles.y = atan2(delta.y, delta.x) * (180.0f / 3.14159265359f);
+    angles.z = 0.0f;
+    return angles;
+}
+
+// Normalizes angles to the range [-180, 180] for pitch and yaw
+static void NormalizeAngles(Vector3& angles) {
+    if (angles.x > 89.0f) angles.x = 89.0f;
+    if (angles.x < -89.0f) angles.x = -89.0f;
+    while (angles.y > 180.0f) angles.y -= 360.0f;
+    while (angles.y < -180.0f) angles.y += 360.0f;
+    angles.z = 0.0f;
+}
+
 void DoAimAssist(uintptr_t localPawn, int localTeam, int screenW, int screenH) {
     if (!g_config.enabled || !localPawn) return;
 
     Vector3* viewAngles = (Vector3*)(hClient + O::dwViewAngles);
     if (!viewAngles) return;
 
-    // Calculate local player's eye position
+    bool keyDown = IsKeyDown(g_config.aimKey);
+    if (!keyDown) {
+        g_hasTarget = false;
+        return;
+    }
+
+    // Local player's eye position
     Vector3 localEye = GetOrigin(localPawn);
     Vector3 viewOff = GetViewOffset(localPawn);
     localEye.z += viewOff.z;
 
+    // Find the best target within the aim radius
     float bestDist = g_config.aimRadius + 1.0f;
     uintptr_t bestTarget = 0;
     Vector3 bestHead = { 0, 0, 0 };
 
-    // Iterate over all possible player slots (max 64)
     for (int i = 1; i <= 64; i++) {
         uintptr_t pCtrl = GetEntity(i);
         if (!IsValid(pCtrl)) continue;
@@ -264,15 +329,21 @@ void DoAimAssist(uintptr_t localPawn, int localTeam, int screenW, int screenH) {
         int hp = HP(pPawn);
         int team = Team(pPawn);
         int life = Life(pPawn);
-        if (hp <= 0 || hp > 100) continue;         // dead or invalid
-        if (life != 0) continue;                   // alive check (0 = alive)
-        if (team != 2 && team != 3) continue;      // not a player team (T=2, CT=3)
-        if (team == localTeam) continue;           // skip teammates
+        if (hp <= 0 || hp > 100) continue;
+        if (life != 0) continue;
+        if (team != 2 && team != 3) continue;
+        if (team == localTeam) continue;
 
-        // Get head position (origin + view offset)
+        // Calculate head position with forward offset
         Vector3 head = GetOrigin(pPawn);
         Vector3 off = GetViewOffset(pPawn);
-        head.z += off.z;
+        head.z += off.z + HEAD_OFFSET;
+
+        Vector3 eyeAngles = GetEyeAngles(pPawn);
+        float yaw = eyeAngles.y * (3.14159265359f / 180.0f);
+        Vector3 forward = { cosf(yaw), sinf(yaw), 0.0f };
+        head.x += forward.x * HEAD_FORWARD_OFFSET;
+        head.y += forward.y * HEAD_FORWARD_OFFSET;
 
         Vector2 screenHead;
         if (!WorldToScreen(head, screenHead, screenW, screenH)) continue;
@@ -287,34 +358,42 @@ void DoAimAssist(uintptr_t localPawn, int localTeam, int screenW, int screenH) {
         }
     }
 
-    // If a valid target is found and the aim key is held, apply smooth aim correction
-    if (bestTarget && IsKeyDown(g_config.aimKey)) {
-        float dx = bestHead.x - localEye.x;
-        float dy = bestHead.y - localEye.y;
-        float dz = bestHead.z - localEye.z;
-        float dist = sqrt(dx * dx + dy * dy + dz * dz);
-        if (dist > 1.0f) {
-            float targetPitch = -atan2(dz, sqrt(dx * dx + dy * dy)) * (180.0f / 3.14159265359f);
-            float targetYaw = atan2(dy, dx) * (180.0f / 3.14159265359f);
+    if (bestTarget) {
+        Vector3 targetAngles = CalculateAngles(localEye, bestHead);
+        NormalizeAngles(targetAngles);
+        g_targetAngles = targetAngles;
+        g_hasTarget = true;
+    }
+    else {
+        g_hasTarget = false;
+        return;
+    }
 
-            float currentPitch = viewAngles->x;
-            float currentYaw = viewAngles->y;
+    // Smoothly interpolate towards target angles
+    if (g_hasTarget) {
+        float currentPitch = viewAngles->x;
+        float currentYaw = viewAngles->y;
 
-            float deltaPitch = targetPitch - currentPitch;
-            float deltaYaw = targetYaw - currentYaw;
-            if (deltaYaw > 180) deltaYaw -= 360;
-            if (deltaYaw < -180) deltaYaw += 360;
+        float deltaPitch = g_targetAngles.x - currentPitch;
+        float deltaYaw = g_targetAngles.y - currentYaw;
+        if (deltaYaw > 180) deltaYaw -= 360;
+        if (deltaYaw < -180) deltaYaw += 360;
 
-            // Smoothing: lower smoothness = more aggressive correction
-            float smoothFactor = 1.0f - g_config.smoothness;
+        float smoothFactor = 1.0f - g_config.smoothness;
+        // Snap if the difference is very small to avoid jitter
+        if (fabs(deltaPitch) < 0.5f && fabs(deltaYaw) < 0.5f) {
+            viewAngles->x = g_targetAngles.x;
+            viewAngles->y = g_targetAngles.y;
+        }
+        else {
             viewAngles->x += deltaPitch * smoothFactor;
             viewAngles->y += deltaYaw * smoothFactor;
-            viewAngles->z = 0.0f;   // roll is always zero
         }
+        viewAngles->z = 0.0f;
     }
 }
 
-// -------------------- IMGUI STYLE SETUP --------------------
+// -------------------- IMGUI STYLE --------------------
 void SetupImGuiStyle() {
     ImGuiStyle& style = ImGui::GetStyle();
     style.WindowRounding = 6.0f;
@@ -377,9 +456,7 @@ void SetupImGuiStyle() {
     colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.10f, 0.10f, 0.13f, 0.50f);
 }
 
-// -------------------- ESP + OVERLAY RENDERING --------------------
-// This function is called every frame from the Present hook.
-// It draws the ESP boxes, health bars, distance, and handles the ImGui menu.
+// -------------------- ESP + OVERLAY RENDERING (OPTIMIZED) --------------------
 void DrawImGuiESP() {
     if (!g_imGuiInitialized) return;
 
@@ -387,7 +464,7 @@ void DrawImGuiESP() {
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
-    // Refresh view matrix and entity system pointers each frame
+    // Update global view matrix and entity system each frame
     memcpy(viewMatrix, (void*)(hClient + O::dwViewMatrix), sizeof(viewMatrix));
     g_pES = *(uintptr_t*)(hClient + O::dwGameEntitySystem);
     uintptr_t pLocal = 0;
@@ -395,19 +472,21 @@ void DrawImGuiESP() {
         pLocal = *(uintptr_t*)(hClient + O::dwLocalPlayerPawn);
     }
 
+    // Only render if we have a valid local player
     if (IsValid(pLocal)) {
         int localTeam = Team(pLocal);
         if (localTeam != 0) {
             int screenW = (int)ImGui::GetIO().DisplaySize.x;
             int screenH = (int)ImGui::GetIO().DisplaySize.y;
 
-            // Apply NoFlash if enabled
             DoNoFlash(pLocal);
 
             ImDrawList* draw = ImGui::GetForegroundDrawList();
             if (draw) {
-                // Collect all valid enemy pawns
-                std::vector<uintptr_t> enemies;
+                // Gather enemies
+                uintptr_t enemies[64];
+                int enemyCount = 0;
+
                 for (int i = 1; i <= 64; i++) {
                     uintptr_t pCtrl = GetEntity(i);
                     if (!IsValid(pCtrl)) continue;
@@ -415,6 +494,7 @@ void DrawImGuiESP() {
                     if (!hPawn || hPawn == 0xFFFFFFFF) continue;
                     uintptr_t pPawn = HandleToEnt(hPawn);
                     if (!IsValid(pPawn) || pPawn == pLocal) continue;
+
                     int hp = HP(pPawn);
                     int team = Team(pPawn);
                     int life = Life(pPawn);
@@ -422,15 +502,28 @@ void DrawImGuiESP() {
                     if (life != 0) continue;
                     if (team != 2 && team != 3) continue;
                     if (team == localTeam) continue;
-                    enemies.push_back(pPawn);
+
+                    if (enemyCount < 64) {
+                        enemies[enemyCount++] = pPawn;
+                    }
                 }
 
                 // Draw ESP for each enemy
-                for (uintptr_t pPawn : enemies) {
+                for (int idx = 0; idx < enemyCount; idx++) {
+                    uintptr_t pPawn = enemies[idx];
                     int hp = HP(pPawn);
                     Vector3 origin = GetOrigin(pPawn);
                     Vector3 viewOffset = GetViewOffset(pPawn);
-                    Vector3 headPos = { origin.x, origin.y, origin.z + viewOffset.z };
+
+                    // Head position with offset
+                    Vector3 headPos = origin;
+                    headPos.z += viewOffset.z + HEAD_OFFSET;
+                    Vector3 eyeAngles = GetEyeAngles(pPawn);
+                    float yaw = eyeAngles.y * (3.14159265359f / 180.0f);
+                    Vector3 forward = { cosf(yaw), sinf(yaw), 0.0f };
+                    headPos.x += forward.x * HEAD_FORWARD_OFFSET;
+                    headPos.y += forward.y * HEAD_FORWARD_OFFSET;
+
                     Vector3 footPos = origin;
 
                     Vector2 screenHead, screenFoot;
@@ -454,10 +547,10 @@ void DrawImGuiESP() {
                     );
                     ImU32 colorBg = IM_COL32(0, 0, 0, 180);
 
-                    // Main bounding box
+                    // Box
                     draw->AddRect(ImVec2(x, y), ImVec2(x + boxWidth, y + boxHeight), color, 0.0f, 0, 2.0f);
 
-                    // Health bar (vertical bar on the left)
+                    // Health bar
                     float barWidth = 5.0f;
                     float barX = x - barWidth - 4.0f;
                     draw->AddRectFilled(ImVec2(barX, y + 1), ImVec2(barX + barWidth, y + boxHeight - 1), colorBg);
@@ -469,16 +562,16 @@ void DrawImGuiESP() {
                         draw->AddRectFilled(ImVec2(barX, y + 1 + fillHeight - fill), ImVec2(barX + barWidth, y + boxHeight - 1), hpColor);
                     }
 
-                    // Head indicator (circle)
+                    // Head dot
                     draw->AddCircleFilled(ImVec2(screenHead.x, screenHead.y), 5.0f, IM_COL32(255, 255, 255, 255));
                     draw->AddCircle(ImVec2(screenHead.x, screenHead.y), 5.0f, IM_COL32(0, 0, 0, 200), 12, 1.5f);
 
-                    // Health text
+                    // HP text
                     char text[16];
                     sprintf_s(text, "%d HP", hp);
                     draw->AddText(ImVec2(x, y + boxHeight + 3), IM_COL32(255, 255, 255, 255), text);
 
-                    // Distance text (if enabled)
+                    // Distance
                     if (g_config.showDistance) {
                         Vector3 localEye = GetOrigin(pLocal);
                         Vector3 viewOffLocal = GetViewOffset(pLocal);
@@ -487,20 +580,20 @@ void DrawImGuiESP() {
                         float dy3D = headPos.y - localEye.y;
                         float dz3D = headPos.z - localEye.z;
                         float dist3D = sqrt(dx3D * dx3D + dy3D * dy3D + dz3D * dz3D);
-                        float distMeters = dist3D * 0.01905f;  // approximate conversion to meters
+                        float distMeters = dist3D * 0.01905f;
                         char distText[32];
                         sprintf_s(distText, "%.0fm", distMeters);
                         draw->AddText(ImVec2(x, y + boxHeight + 3 + 15), IM_COL32(255, 255, 255, 200), distText);
                     }
                 }
 
-                // Perform aim assist after ESP drawing (uses same enemy list internally)
+                // Aim assist (already optimized)
                 DoAimAssist(pLocal, localTeam, screenW, screenH);
             }
         }
     }
 
-    // ImGui menu (toggle with INSERT)
+    // ImGui menu
     if (g_config.showMenu) {
         ImGui::SetNextWindowSize(ImVec2(450, 340), ImGuiCond_FirstUseEver);
         ImGui::Begin("rakhus-cs2-internal - Settings", &g_config.showMenu);
@@ -513,7 +606,6 @@ void DrawImGuiESP() {
         ImGui::SliderFloat("Aim Radius", &g_config.aimRadius, 0.0f, 100.0f, "%.1f px");
         ImGui::SliderFloat("Smoothness", &g_config.smoothness, 0.0f, 1.0f, "%.2f");
 
-        // Aim key binding logic
         static bool bindingActive = false;
         if (bindingActive) {
             ImGui::Text("Press any key or mouse button...");
@@ -609,11 +701,14 @@ void DrawImGuiESP() {
         ImGui::End();
     }
 
-    // Finish ImGui frame and render
     ImGui::EndFrame();
     ImGui::Render();
-    g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
-    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+    // Ensure we have a valid render target before rendering ImGui
+    if (g_mainRenderTargetView) {
+        g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    }
 }
 
 // -------------------- D3D11 PRESENT HOOK --------------------
@@ -621,18 +716,20 @@ typedef HRESULT(__stdcall* Present) (IDXGISwapChain* pSwapChain, UINT SyncInterv
 Present oPresent = nullptr;
 
 HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags) {
-    // Initialize ImGui on the first Present call
+    // First call: initialize ImGui and hook WndProc
     if (!g_imGuiInitialized) {
         if (SUCCEEDED(pSwapChain->GetDevice(__uuidof(ID3D11Device), (void**)&g_pd3dDevice))) {
             g_pd3dDevice->GetImmediateContext(&g_pd3dDeviceContext);
+            g_pSwapChain = pSwapChain;
+
             DXGI_SWAP_CHAIN_DESC sd;
             pSwapChain->GetDesc(&sd);
             g_gameHwnd = sd.OutputWindow;
 
-            ID3D11Texture2D* pBackBuffer;
-            pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)&pBackBuffer);
-            g_pd3dDevice->CreateRenderTargetView(pBackBuffer, NULL, &g_mainRenderTargetView);
-            pBackBuffer->Release();
+            if (!CreateRenderTarget()) {
+                LOG("[-] Failed to create render target view");
+                return oPresent(pSwapChain, SyncInterval, Flags);
+            }
 
             IMGUI_CHECKVERSION();
             ImGui::CreateContext();
@@ -644,7 +741,6 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
             ImGui_ImplWin32_Init(g_gameHwnd);
             ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
-            // Hook window procedure for ImGui input
             g_OriginalWndProc = (WNDPROC)SetWindowLongPtr(g_gameHwnd, GWLP_WNDPROC, (LONG_PTR)HookedWndProc);
 
             LoadConfig();
@@ -652,18 +748,52 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
             g_imGuiInitialized = true;
             LOG("[+] ImGui and WndProc hook initialized");
         }
+        else {
+            LOG("[-] Failed to get D3D11 device");
+            return oPresent(pSwapChain, SyncInterval, Flags);
+        }
+    }
+    else {
+        // Handle swapchain resizing or recreation
+        if (g_pSwapChain != pSwapChain) {
+            g_pSwapChain = pSwapChain;
+            CleanupRenderTarget();
+            if (!CreateRenderTarget()) {
+                LOG("[-] Failed to recreate render target after swapchain change");
+                return oPresent(pSwapChain, SyncInterval, Flags);
+            }
+        }
+        else {
+            // Check if the backbuffer size changed (e.g., resolution change)
+            DXGI_SWAP_CHAIN_DESC sd;
+            pSwapChain->GetDesc(&sd);
+            // We could compare dimensions with previous, but for simplicity we recreate if any error occurs.
+            // A more robust method: try to get the backbuffer, if fails, recreate.
+            ID3D11Texture2D* pBackBuffer = nullptr;
+            HRESULT hr = pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)&pBackBuffer);
+            if (FAILED(hr) || !pBackBuffer) {
+                // Backbuffer lost, recreate render target
+                CleanupRenderTarget();
+                if (!CreateRenderTarget()) {
+                    LOG("[-] Failed to recreate render target after backbuffer loss");
+                    return oPresent(pSwapChain, SyncInterval, Flags);
+                }
+            }
+            else {
+                pBackBuffer->Release();
+            }
+        }
     }
 
-    // Render our overlay if ImGui is ready
-    if (g_imGuiInitialized) {
+    // Now render ImGui
+    if (g_imGuiInitialized && g_mainRenderTargetView) {
         DrawImGuiESP();
     }
 
-    // Call original Present
     return oPresent(pSwapChain, SyncInterval, Flags);
 }
 
-// -------------------- MAIN THREAD (ENTRY POINT) --------------------
+// -------------------- MAIN THREAD --------------------
 DWORD WINAPI MainLoop(LPVOID) {
     LOG("[*] Main loop started");
 
@@ -682,7 +812,7 @@ DWORD WINAPI MainLoop(LPVOID) {
         return 0;
     }
 
-    // Install D3D11 Present hook using Kiero
+    // Hook D3D11 Present
     bool init_hook = false;
     do {
         if (kiero::init(kiero::RenderType::D3D11) == kiero::Status::Success) {
@@ -694,7 +824,7 @@ DWORD WINAPI MainLoop(LPVOID) {
         Sleep(100);
     } while (!init_hook);
 
-    // Main event loop: listen for INSERT key to toggle menu
+    // Menu toggle loop (INSERT key)
     static bool lastInsertState = false;
     while (true) {
         bool insertState = GetAsyncKeyState(VK_INSERT) & 0x8000;

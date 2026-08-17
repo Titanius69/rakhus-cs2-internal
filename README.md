@@ -5,6 +5,13 @@ Features include ESP (wallhack), smooth aim assist, and NoFlash – all configur
 
 ---
 
+## Known Issues
+
+- Head position is buggy
+- When you go to an another match, or leave cs2.exe crashes
+
+---
+
 ## Features
 
 - **ESP (Wallhack)**  

@@ -2,10 +2,6 @@
 #include <cstddef>
 #include <cstdint>
 
-#pragma once
-#include <cstddef>
-#include <cstdint>
-
 namespace O {
     // client.dll
     constexpr std::ptrdiff_t dwEntityList = 0x2554050;
@@ -21,9 +17,9 @@ namespace O {
     constexpr std::ptrdiff_t m_lifeState = 0x354;
     constexpr std::ptrdiff_t m_iTeamNum = 0x3E7;
     constexpr std::ptrdiff_t m_pGameSceneNode = 0x330;
-    constexpr std::ptrdiff_t m_vecOrigin = 0x80;
-    constexpr std::ptrdiff_t m_vecViewOffset = 0xE78;
-    constexpr std::ptrdiff_t m_iIDEntIndex = 0x342C;   
+    constexpr std::ptrdiff_t m_vecOrigin = 0x80;          // CGameSceneNode::m_vecOrigin
+    constexpr std::ptrdiff_t m_vecViewOffset = 0xE78;     // C_BaseModelEntity::m_vecViewOffset
+    constexpr std::ptrdiff_t m_angEyeAngles = 0x3350;     // C_CSPlayerPawn::m_angEyeAngles
 
     // entity list
     constexpr std::ptrdiff_t kListOffset = 0x10;
