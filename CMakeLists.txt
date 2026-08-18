@@ -1,6 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.15)
 project(rakhus VERSION 1.0.0 LANGUAGES CXX C)
-
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
@@ -32,6 +31,7 @@ set(INCLUDE_DIRS
 )
 
 add_library(${PROJECT_NAME} SHARED ${SOURCES} ${HEADERS})
+
 target_include_directories(${PROJECT_NAME} PRIVATE ${INCLUDE_DIRS})
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
@@ -44,5 +44,15 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
     _UNICODE
 )
 
+# FIX: Remove /EHsc and add /EHa for SEH + C++ exceptions
+if(MSVC)
+    string(REPLACE "/EHsc" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+    string(REPLACE "/EHsc" "" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
+    string(REPLACE "/EHsc" "" CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")
+    
+    target_compile_options(${PROJECT_NAME} PRIVATE /EHa)
+endif()
+
 target_link_libraries(${PROJECT_NAME} PRIVATE ${DX_LIBS} ${WIN_LIBS})
+
 install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION bin LIBRARY DESTINATION lib ARCHIVE DESTINATION lib)
