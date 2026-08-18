@@ -172,6 +172,3 @@ Using this cheat may result in a permanent ban from CS2. Use at your own risk.
 ## License
 
 This project is licensed under the MIT License – see the [LICENSE](LICENSE) file for details.
-```
-
----
