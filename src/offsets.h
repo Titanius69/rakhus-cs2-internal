@@ -60,7 +60,7 @@ namespace O {
 
     // ---------- Other ----------
     constexpr std::ptrdiff_t m_pObserverServices = 0x1220;
-    // C_CSPlayerPawnBase (őse a C_CSPlayerPawn-nak)
+    // C_CSPlayerPawnBase
     constexpr std::ptrdiff_t m_flLastSmokeOverlayAlpha = 0x1448; // float32
     constexpr std::ptrdiff_t m_flLastSmokeAge = 0x144C;          // float32
     constexpr std::ptrdiff_t m_vLastSmokeOverlayColor = 0x1450;  // Vector
