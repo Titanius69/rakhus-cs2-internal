@@ -30,6 +30,7 @@ set(INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/kiero/minhook/src
 )
 
+# RC fájl NÉLKÜL - csak SOURCES és HEADERS
 add_library(${PROJECT_NAME} SHARED ${SOURCES} ${HEADERS})
 
 target_include_directories(${PROJECT_NAME} PRIVATE ${INCLUDE_DIRS})

@@ -1,10 +1,9 @@
 // ========================================================================
-// Rakhus CS2 Internal Cheat – FINAL STABLE RELEASE
-// Features: ESP, Smooth Aim Assist, NoFlash, NoSmoke (stable), 
-// NoVisualRecoil, Spectator List, Hitmarker, FOV Circle
+// Rakhus CS2 Internal Cheat – Professional Edition
+// Features: ESP, Smooth Aim Assist, NoFlash, NoSmoke, NoVisualRecoil,
+// Spectator List, Hitmarker, FOV Circle, Modern GUI
 // ========================================================================
 
-#include "pch.h"
 #include <Windows.h>
 #include <Psapi.h>
 #include <cstdint>
@@ -31,6 +30,16 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 
+// -------------------- FONT AWESOME ICONS --------------------
+#define ICON_MIN_FA 0xf000
+#define ICON_MAX_FA 0xf8ff
+
+#define ICON_FA_CROSSHAIRS "\uf05b"
+#define ICON_FA_EYE        "\uf06e"
+#define ICON_FA_COG        "\uf013"
+#define ICON_FA_SAVE       "\uf0c7"
+#define ICON_FA_PLUS       "\uf067"
+
 // -------------------- CONSOLE --------------------
 void InitConsole() {
     AllocConsole();
@@ -44,8 +53,8 @@ void InitConsole() {
 #define LOG_FMT(f, ...) printf(f, __VA_ARGS__)
 
 // -------------------- GLOBALS --------------------
-static uintptr_t g_pES = 0;                       // Entity system pointer
-static uintptr_t hClient = 0;                    // Base address of client.dll
+static uintptr_t g_pES = 0;
+static uintptr_t hClient = 0;
 HMODULE g_hModule = nullptr;
 HWND g_gameHwnd = nullptr;
 
@@ -59,8 +68,8 @@ WNDPROC g_OriginalWndProc = nullptr;
 struct Vector3 { float x, y, z; };
 struct Vector2 { float x, y; };
 
-static Vector3 g_targetAngles = { 0, 0, 0 };      // Last computed aim angle
-static bool g_hasTarget = false;                  // Whether we have a valid target
+static Vector3 g_targetAngles = { 0, 0, 0 };
+static bool g_hasTarget = false;
 
 static bool g_hitMarkerActive = false;
 static std::chrono::steady_clock::time_point g_hitMarkerTime;
@@ -146,7 +155,7 @@ void LoadConfig() {
     file.close();
 }
 
-// -------------------- SAFE MEMORY HELPERS (using __try/__except) --------------------
+// -------------------- SAFE MEMORY HELPERS --------------------
 static bool IsValid(uintptr_t a) {
     return a > 0x10000 && a < 0x7FFFFFFFFFFF;
 }
@@ -183,9 +192,7 @@ static bool IsAlive(uintptr_t pawn) {
     return life == 0;
 }
 
-// ------------------------------------------------------------------
-// Entity list retrieval (supports up to 4096 entities)
-// ------------------------------------------------------------------
+// -------------------- ENTITY LIST (chunk-based) --------------------
 static uintptr_t GetEntity(int idx) {
     if (idx < 0 || idx > 4096) return 0;
     if (!g_pES || !IsValid(g_pES)) return 0;
@@ -276,7 +283,12 @@ bool WorldToScreen(const Vector3& world, Vector2& screen, int screenW, int scree
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
-// -------------------- FEATURES (all protected) --------------------
+// -------------------- KEY STATE --------------------
+bool IsKeyDown(int key) {
+    return (GetAsyncKeyState(key) & 0x8000) != 0;
+}
+
+// -------------------- FEATURES --------------------
 void DoNoFlash(uintptr_t localPawn) {
     if (!g_config.noFlash || !localPawn) return;
     SafeWrite<float>(localPawn + O::m_flFlashOverlayAlpha, 0.0f);
@@ -285,36 +297,23 @@ void DoNoFlash(uintptr_t localPawn) {
     SafeWrite<float>(localPawn + O::m_flFlashBangTime, 0.0f);
 }
 
-/**
- * NoSmoke implementation:
- * - Zeroes the local player's smoke overlay fields (transparency, age, color).
- * - Iterates through all entities (0..4096) and disables any smoke grenade projectile
- *   by resetting its spawn flag and related effect flags.
- * - All memory accesses are protected with __try/__except to avoid crashes.
- * - Performance is acceptable due to 500ms cooldown between full scans.
- */
 void DoNoSmoke(uintptr_t localPawn) {
     if (!g_config.noSmoke || !localPawn) return;
     if (!IsAlive(localPawn)) return;
 
-    // Clear local overlay – prevents rendering of smoke on the player's screen
     SafeWrite<float>(localPawn + O::m_flLastSmokeOverlayAlpha, 0.0f);
     SafeWrite<float>(localPawn + O::m_flLastSmokeAge, 0.0f);
     SafeWrite<Vector3>(localPawn + O::m_vLastSmokeOverlayColor, Vector3{ 1.0f, 1.0f, 1.0f });
 
-    // Refresh entity system pointer
     g_pES = SafeRead<uintptr_t>(hClient + O::dwGameEntitySystem, 0);
     if (!g_pES) return;
 
-    // Scan all entities (smoke projectiles can appear at high indices)
     for (int i = 1; i <= 4096; i++) {
         uintptr_t ent = GetEntity(i);
         if (!ent || !IsValid(ent)) continue;
 
-        // Check if this entity is a smoke grenade projectile
         uint8_t spawned = SafeRead<uint8_t>(ent + O::m_bSmokeEffectSpawned, 0);
         if (spawned == 1) {
-            // Disable smoke effect by clearing its state flags
             SafeWrite<uint8_t>(ent + O::m_bSmokeEffectSpawned, 0);
             SafeWrite<uint8_t>(ent + O::m_bDidSmokeEffect, 0);
             SafeWrite<uint32_t>(ent + O::m_nSmokeEffectTickBegin, 0);
@@ -322,20 +321,23 @@ void DoNoSmoke(uintptr_t localPawn) {
     }
 }
 
+// NoVisualRecoil – zero out all punch components to kill both recoil and shake
 void DoNoVisualRecoil(uintptr_t localPawn) {
     if (!g_config.noVisualRecoil || !localPawn) return;
     uintptr_t punchServices = SafeRead<uintptr_t>(localPawn + O::m_pAimPunchServices, 0);
     if (!punchServices || !IsValid(punchServices)) return;
+
+    // Zero predictable and unpredictable punch – this kills the view shake
     SafeWrite<Vector3>(punchServices + O::AimPunch::m_predictableBaseAngle, Vector3{ 0,0,0 });
     SafeWrite<Vector3>(punchServices + O::AimPunch::m_predictableBaseAngleVel, Vector3{ 0,0,0 });
     SafeWrite<Vector3>(punchServices + O::AimPunch::m_unpredictableBaseAngle, Vector3{ 0,0,0 });
 }
 
-// -------------------- SPECTATOR LIST (no dynamic allocation) --------------------
-void DrawSpectatorList(uintptr_t localPawn, ImDrawList* draw) {
-    if (!g_config.spectatorList || !localPawn || !IsAlive(localPawn)) return;
+// -------------------- SPECTATOR LIST (FIXED: top‑right corner, 15px from edge) --------------------
+void DrawSpectatorList(uintptr_t localPawn) {
+    if (!g_config.spectatorList) return;
+    if (!localPawn) return;
 
-    // Static buffers to avoid heap allocation per frame
     static char specNames[64][128];
     static int specCount = 0;
     specCount = 0;
@@ -360,10 +362,15 @@ void DrawSpectatorList(uintptr_t localPawn, ImDrawList* draw) {
     }
 
     if (specCount > 0) {
-        ImGui::SetNextWindowPos(ImVec2(10, 100), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(0, 0), ImGuiCond_Always);
-        ImGui::Begin("Spectators", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoBackground |
-            ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
+        float screenW = ImGui::GetIO().DisplaySize.x;
+        float padding = 15.0f;
+        float windowWidth = 200.0f;
+        // Bal felső sarok referencia, a jobb széltől padding távolságra
+        ImGui::SetNextWindowPos(ImVec2(screenW - padding - windowWidth, padding), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(windowWidth, 0), ImGuiCond_Always);
+        ImGui::Begin("Spectators", nullptr,
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize);
         ImGui::Text("Spectators (%d):", specCount);
         for (int i = 0; i < specCount; i++) {
             ImGui::Text("- %s", specNames[i]);
@@ -372,7 +379,7 @@ void DrawSpectatorList(uintptr_t localPawn, ImDrawList* draw) {
     }
 }
 
-// -------------------- HITMARKER --------------------
+// -------------------- HITMARKER (only triggers when YOU receive damage) --------------------
 void UpdateHitmarker(uintptr_t localPawn, uintptr_t localController) {
     if (!g_config.hitmarker || !localPawn || !localController) return;
     static size_t lastDamageCount = 0;
@@ -380,8 +387,10 @@ void UpdateHitmarker(uintptr_t localPawn, uintptr_t localController) {
     if (!damageServices || !IsValid(damageServices)) return;
     uintptr_t damageList = damageServices + O::Damage::m_DamageList;
     if (!IsValid(damageList)) return;
-    size_t count = SafeRead<size_t>(damageList, 0);
-    if (count > lastDamageCount) {
+
+    // CUtlVector: [0] = m_pElements (8 bytes), [8] = m_nSize (int)
+    int count = SafeRead<int>(damageList + 8, 0);
+    if (count > 0 && count > (int)lastDamageCount) {
         g_hitMarkerActive = true;
         g_hitMarkerTime = std::chrono::steady_clock::now();
     }
@@ -410,11 +419,7 @@ void DrawFovCircle(ImDrawList* draw) {
     draw->AddCircle(center, g_config.aimRadius, IM_COL32(255, 255, 255, 80), 64, 1.5f);
 }
 
-// -------------------- AIM ASSIST (angle-based, smooth) --------------------
-bool IsKeyDown(int key) {
-    return (GetAsyncKeyState(key) & 0x8000) != 0;
-}
-
+// -------------------- AIM ASSIST --------------------
 static Vector3 CalculateAngles(const Vector3& source, const Vector3& target) {
     Vector3 delta = { target.x - source.x, target.y - source.y, target.z - source.z };
     float dist = sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
@@ -435,7 +440,6 @@ static void NormalizeAngles(Vector3& angles) {
 }
 
 void DoAimAssist(uintptr_t localPawn, int localTeam, int screenW, int screenH) {
-    // Basic checks
     if (!g_config.enabled || !localPawn || !IsAlive(localPawn)) return;
     if (!IsKeyDown(g_config.aimKey)) {
         g_hasTarget = false;
@@ -445,7 +449,6 @@ void DoAimAssist(uintptr_t localPawn, int localTeam, int screenW, int screenH) {
     uintptr_t viewAnglesAddr = hClient + O::dwViewAngles;
     if (!IsValid(viewAnglesAddr)) return;
 
-    // Local player eye position
     Vector3 localEye = GetOrigin(localPawn);
     Vector3 viewOff = GetViewOffset(localPawn);
     localEye.z += viewOff.z;
@@ -458,7 +461,6 @@ void DoAimAssist(uintptr_t localPawn, int localTeam, int screenW, int screenH) {
     uintptr_t bestTarget = 0;
     Vector3 bestHead = { 0,0,0 };
 
-    // Iterate players (0..64)
     for (int i = 1; i <= 64; i++) {
         uintptr_t pCtrl = GetEntity(i);
         if (!pCtrl) continue;
@@ -528,7 +530,6 @@ void DoAimAssist(uintptr_t localPawn, int localTeam, int screenW, int screenH) {
         return;
     }
 
-    // Apply smoothed aim
     if (g_hasTarget) {
         __try {
             Vector3 currentAngles = *(Vector3*)viewAnglesAddr;
@@ -556,71 +557,129 @@ void DoAimAssist(uintptr_t localPawn, int localTeam, int screenW, int screenH) {
 
             *(Vector3*)viewAnglesAddr = newAngles;
         }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            // Silent fail
-        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
 }
 
-// -------------------- IMGUI STYLE --------------------
+// -------------------- MODERN GUI STYLE --------------------
 void SetupImGuiStyle() {
     ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowRounding = 6.0f; style.FrameRounding = 4.0f; style.GrabRounding = 4.0f;
-    style.ChildRounding = 4.0f; style.PopupRounding = 4.0f; style.ScrollbarRounding = 4.0f;
-    style.WindowPadding = ImVec2(10, 10); style.FramePadding = ImVec2(6, 4);
+    style.WindowRounding = 8.0f;
+    style.FrameRounding = 4.0f;
+    style.GrabRounding = 4.0f;
+    style.ChildRounding = 4.0f;
+    style.PopupRounding = 4.0f;
+    style.ScrollbarRounding = 4.0f;
+    style.WindowPadding = ImVec2(12, 12);
+    style.FramePadding = ImVec2(8, 6);
+    style.ItemSpacing = ImVec2(8, 8);
+    style.ItemInnerSpacing = ImVec2(4, 4);
+    style.IndentSpacing = 12.0f;
+    style.ScrollbarSize = 12.0f;
+    style.GrabMinSize = 8.0f;
 
     ImVec4* colors = style.Colors;
-    colors[ImGuiCol_Text] = ImVec4(1.00f, 1.00f, 1.00f, 1.00f);
-    colors[ImGuiCol_TextDisabled] = ImVec4(0.50f, 0.50f, 0.50f, 1.00f);
-    colors[ImGuiCol_WindowBg] = ImVec4(0.10f, 0.10f, 0.13f, 0.95f);
-    colors[ImGuiCol_ChildBg] = ImVec4(0.10f, 0.10f, 0.13f, 0.50f);
-    colors[ImGuiCol_PopupBg] = ImVec4(0.10f, 0.10f, 0.13f, 0.95f);
-    colors[ImGuiCol_Border] = ImVec4(0.30f, 0.30f, 0.35f, 0.60f);
+    colors[ImGuiCol_WindowBg] = ImVec4(0.08f, 0.08f, 0.12f, 0.92f);
+    colors[ImGuiCol_ChildBg] = ImVec4(0.10f, 0.10f, 0.14f, 0.80f);
+    colors[ImGuiCol_PopupBg] = ImVec4(0.08f, 0.08f, 0.12f, 0.95f);
+    colors[ImGuiCol_TitleBg] = ImVec4(0.15f, 0.15f, 0.25f, 0.90f);
+    colors[ImGuiCol_TitleBgActive] = ImVec4(0.20f, 0.25f, 0.40f, 0.95f);
+    colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.10f, 0.10f, 0.15f, 0.50f);
+    colors[ImGuiCol_MenuBarBg] = ImVec4(0.10f, 0.10f, 0.15f, 0.90f);
+    colors[ImGuiCol_Border] = ImVec4(0.25f, 0.30f, 0.45f, 0.60f);
     colors[ImGuiCol_BorderShadow] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    colors[ImGuiCol_FrameBg] = ImVec4(0.20f, 0.20f, 0.25f, 0.60f);
-    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.30f, 0.30f, 0.35f, 0.80f);
-    colors[ImGuiCol_FrameBgActive] = ImVec4(0.40f, 0.40f, 0.45f, 1.00f);
-    colors[ImGuiCol_TitleBg] = ImVec4(0.10f, 0.10f, 0.13f, 1.00f);
-    colors[ImGuiCol_TitleBgActive] = ImVec4(0.15f, 0.15f, 0.20f, 1.00f);
-    colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.10f, 0.10f, 0.13f, 0.50f);
-    colors[ImGuiCol_MenuBarBg] = ImVec4(0.10f, 0.10f, 0.13f, 1.00f);
-    colors[ImGuiCol_ScrollbarBg] = ImVec4(0.10f, 0.10f, 0.13f, 0.50f);
-    colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.30f, 0.30f, 0.35f, 0.80f);
-    colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.40f, 0.40f, 0.45f, 1.00f);
-    colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.50f, 0.50f, 0.55f, 1.00f);
-    colors[ImGuiCol_CheckMark] = ImVec4(0.20f, 0.60f, 1.00f, 1.00f);
-    colors[ImGuiCol_SliderGrab] = ImVec4(0.20f, 0.60f, 1.00f, 0.80f);
-    colors[ImGuiCol_SliderGrabActive] = ImVec4(0.20f, 0.60f, 1.00f, 1.00f);
-    colors[ImGuiCol_Button] = ImVec4(0.20f, 0.30f, 0.60f, 0.70f);
-    colors[ImGuiCol_ButtonHovered] = ImVec4(0.30f, 0.40f, 0.70f, 0.90f);
-    colors[ImGuiCol_ButtonActive] = ImVec4(0.10f, 0.20f, 0.50f, 1.00f);
-    colors[ImGuiCol_Header] = ImVec4(0.20f, 0.30f, 0.60f, 0.60f);
-    colors[ImGuiCol_HeaderHovered] = ImVec4(0.30f, 0.40f, 0.70f, 0.80f);
-    colors[ImGuiCol_HeaderActive] = ImVec4(0.10f, 0.20f, 0.50f, 0.90f);
-    colors[ImGuiCol_Separator] = ImVec4(0.30f, 0.30f, 0.35f, 0.60f);
-    colors[ImGuiCol_SeparatorHovered] = ImVec4(0.40f, 0.40f, 0.45f, 1.00f);
-    colors[ImGuiCol_SeparatorActive] = ImVec4(0.50f, 0.50f, 0.55f, 1.00f);
-    colors[ImGuiCol_ResizeGrip] = ImVec4(0.30f, 0.30f, 0.35f, 0.60f);
-    colors[ImGuiCol_ResizeGripHovered] = ImVec4(0.40f, 0.40f, 0.45f, 1.00f);
-    colors[ImGuiCol_ResizeGripActive] = ImVec4(0.50f, 0.50f, 0.55f, 1.00f);
-    colors[ImGuiCol_Tab] = ImVec4(0.15f, 0.15f, 0.20f, 0.80f);
-    colors[ImGuiCol_TabHovered] = ImVec4(0.25f, 0.35f, 0.65f, 1.00f);
-    colors[ImGuiCol_TabActive] = ImVec4(0.20f, 0.30f, 0.60f, 1.00f);
-    colors[ImGuiCol_TabUnfocused] = ImVec4(0.10f, 0.10f, 0.13f, 0.80f);
-    colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.15f, 0.15f, 0.20f, 1.00f);
-    colors[ImGuiCol_PlotLines] = ImVec4(0.20f, 0.60f, 1.00f, 1.00f);
-    colors[ImGuiCol_PlotLinesHovered] = ImVec4(0.80f, 0.40f, 0.00f, 1.00f);
-    colors[ImGuiCol_PlotHistogram] = ImVec4(0.20f, 0.60f, 1.00f, 1.00f);
-    colors[ImGuiCol_PlotHistogramHovered] = ImVec4(0.80f, 0.40f, 0.00f, 1.00f);
-    colors[ImGuiCol_TextSelectedBg] = ImVec4(0.20f, 0.60f, 1.00f, 0.35f);
-    colors[ImGuiCol_DragDropTarget] = ImVec4(0.20f, 0.60f, 1.00f, 0.90f);
-    colors[ImGuiCol_NavHighlight] = ImVec4(0.20f, 0.60f, 1.00f, 1.00f);
-    colors[ImGuiCol_NavWindowingHighlight] = ImVec4(0.20f, 0.60f, 1.00f, 0.70f);
-    colors[ImGuiCol_NavWindowingDimBg] = ImVec4(0.10f, 0.10f, 0.13f, 0.50f);
-    colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.10f, 0.10f, 0.13f, 0.50f);
+    colors[ImGuiCol_Separator] = ImVec4(0.20f, 0.25f, 0.40f, 0.50f);
+    colors[ImGuiCol_SeparatorHovered] = ImVec4(0.30f, 0.40f, 0.60f, 0.80f);
+    colors[ImGuiCol_SeparatorActive] = ImVec4(0.40f, 0.50f, 0.70f, 1.00f);
+    colors[ImGuiCol_Button] = ImVec4(0.20f, 0.30f, 0.50f, 0.70f);
+    colors[ImGuiCol_ButtonHovered] = ImVec4(0.30f, 0.40f, 0.65f, 0.90f);
+    colors[ImGuiCol_ButtonActive] = ImVec4(0.15f, 0.25f, 0.45f, 1.00f);
+    colors[ImGuiCol_CheckMark] = ImVec4(0.30f, 0.70f, 1.00f, 1.00f);
+    colors[ImGuiCol_SliderGrab] = ImVec4(0.30f, 0.70f, 1.00f, 0.80f);
+    colors[ImGuiCol_SliderGrabActive] = ImVec4(0.30f, 0.70f, 1.00f, 1.00f);
+    colors[ImGuiCol_Header] = ImVec4(0.20f, 0.35f, 0.60f, 0.60f);
+    colors[ImGuiCol_HeaderHovered] = ImVec4(0.25f, 0.40f, 0.70f, 0.80f);
+    colors[ImGuiCol_HeaderActive] = ImVec4(0.15f, 0.30f, 0.55f, 0.90f);
+    colors[ImGuiCol_FrameBg] = ImVec4(0.15f, 0.15f, 0.25f, 0.60f);
+    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.20f, 0.25f, 0.40f, 0.80f);
+    colors[ImGuiCol_FrameBgActive] = ImVec4(0.25f, 0.30f, 0.50f, 1.00f);
+    colors[ImGuiCol_Text] = ImVec4(1.00f, 1.00f, 1.00f, 0.95f);
+    colors[ImGuiCol_TextDisabled] = ImVec4(0.60f, 0.60f, 0.70f, 0.80f);
+    colors[ImGuiCol_Tab] = ImVec4(0.12f, 0.12f, 0.20f, 0.80f);
+    colors[ImGuiCol_TabHovered] = ImVec4(0.25f, 0.35f, 0.55f, 1.00f);
+    colors[ImGuiCol_TabActive] = ImVec4(0.20f, 0.30f, 0.50f, 1.00f);
+    colors[ImGuiCol_TabUnfocused] = ImVec4(0.10f, 0.10f, 0.15f, 0.80f);
+    colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.15f, 0.20f, 0.30f, 1.00f);
 }
 
-// -------------------- RENDER TARGET HELPERS --------------------
+bool LoadFontFromDisk() {
+    char modulePath[MAX_PATH];
+    GetModuleFileNameA(g_hModule, modulePath, MAX_PATH);
+    char* lastSlash = strrchr(modulePath, '\\');
+    if (lastSlash) *(lastSlash + 1) = '\0';
+    char fontPath[MAX_PATH];
+    snprintf(fontPath, MAX_PATH, "%sfont.ttf", modulePath);
+    LOG_FMT("[*] Loading font from disk: %s\n", fontPath);
+
+    FILE* file = fopen(fontPath, "rb");
+    if (!file) {
+        LOG_FMT("[-] Cannot open font file: %s\n", fontPath);
+        return false;
+    }
+    fseek(file, 0, SEEK_END);
+    long fileSize = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    if (fileSize <= 0) {
+        LOG("[-] Invalid font file size");
+        fclose(file);
+        return false;
+    }
+    void* pData = malloc(fileSize);
+    if (!pData) {
+        LOG("[-] Failed to allocate memory for font");
+        fclose(file);
+        return false;
+    }
+    size_t bytesRead = fread(pData, 1, fileSize, file);
+    fclose(file);
+    if (bytesRead != fileSize) {
+        LOG_FMT("[-] Failed to read complete font file (got %zu of %ld bytes)\n", bytesRead, fileSize);
+        free(pData);
+        return false;
+    }
+    LOG_FMT("[+] Font loaded from disk: %ld bytes\n", fileSize);
+
+    ImGuiIO& io = ImGui::GetIO();
+    static const ImWchar faRange[] = { 0xF000, 0xF8FF, 0 };
+    static ImVector<ImWchar> glyphRanges;
+    ImFontGlyphRangesBuilder builder;
+    builder.AddRanges(io.Fonts->GetGlyphRangesDefault());
+    builder.AddRanges(faRange);
+    builder.BuildRanges(&glyphRanges);
+
+    ImFontConfig fontConfig;
+    fontConfig.OversampleH = 2;
+    fontConfig.OversampleV = 1;
+    fontConfig.PixelSnapH = false;
+    fontConfig.FontDataOwnedByAtlas = true;
+
+    ImFont* font = io.Fonts->AddFontFromMemoryTTF(
+        pData,
+        static_cast<int>(fileSize),
+        16.0f,
+        &fontConfig,
+        glyphRanges.Data
+    );
+    if (!font) {
+        LOG("[-] Failed to load font into ImGui");
+        free(pData);
+        return false;
+    }
+    LOG("[+] Font Awesome 6 Solid + default glyphs loaded successfully");
+    return true;
+}
+
+// -------------------- RENDER TARGET --------------------
 bool CreateRenderTarget() {
     if (!g_pSwapChain) return false;
     ID3D11Texture2D* pBackBuffer = nullptr;
@@ -637,9 +696,10 @@ void CleanupRenderTarget() {
 }
 
 // -------------------- WNDPROC HOOK --------------------
+extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
-// -------------------- MAIN DRAW (fully protected) --------------------
+// -------------------- MAIN DRAW --------------------
 void DrawImGuiESP() {
     try {
         if (!g_imGuiInitialized) return;
@@ -648,16 +708,16 @@ void DrawImGuiESP() {
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
+        // --- Entity System ---
         g_pES = SafeRead<uintptr_t>(hClient + O::dwGameEntitySystem, 0);
 
-        // Safely copy view matrix
+        // --- ViewMatrix ---
         try {
             memcpy(viewMatrix, (void*)(hClient + O::dwViewMatrix), sizeof(viewMatrix));
         }
-        catch (...) {
-            // If copy fails, viewMatrix remains stale – but we don't crash
-        }
+        catch (...) {}
 
+        // --- Local Player ---
         uintptr_t pLocal = SafeRead<uintptr_t>(hClient + O::dwLocalPlayerPawn, 0);
         bool isAlive = IsAlive(pLocal);
 
@@ -672,6 +732,7 @@ void DrawImGuiESP() {
                 int screenW = (int)ImGui::GetIO().DisplaySize.x;
                 int screenH = (int)ImGui::GetIO().DisplaySize.y;
 
+                // --- Feature calls ---
                 DoNoFlash(pLocal);
                 DoNoSmoke(pLocal);
                 DoNoVisualRecoil(pLocal);
@@ -679,7 +740,7 @@ void DrawImGuiESP() {
 
                 ImDrawList* draw = ImGui::GetForegroundDrawList();
                 if (draw) {
-                    // ---- ESP ----
+                    // ---- ESP: enemies ----
                     uintptr_t enemies[64];
                     int enemyCount = 0;
                     for (int i = 1; i <= 64; i++) {
@@ -696,6 +757,7 @@ void DrawImGuiESP() {
                         if (enemyCount < 64) enemies[enemyCount++] = pPawn;
                     }
 
+                    // ---- ESP: draw boxes, HP bars, etc. ----
                     for (int idx = 0; idx < enemyCount; idx++) {
                         uintptr_t pPawn = enemies[idx];
                         int hp = HP(pPawn);
@@ -750,76 +812,131 @@ void DrawImGuiESP() {
                         }
                     }
 
-                    DrawSpectatorList(pLocal, draw);
+                    DrawSpectatorList(pLocal);
                     DrawHitmarker(draw);
                     DrawFovCircle(draw);
                     DoAimAssist(pLocal, localTeam, screenW, screenH);
                 }
             }
         }
+        else {
+            // If local is dead, we can still show spectator list
+            if (pLocal) DrawSpectatorList(pLocal);
+        }
 
-        // -------------------- MENU --------------------
-        if (g_config.showMenu) {
-            ImGui::SetNextWindowSize(ImVec2(450, 380), ImGuiCond_FirstUseEver);
-            ImGui::Begin("rakhus-cs2-internal", &g_config.showMenu);
+        // -------------------- MODERN MENU --------------------
+        static float menuAlpha = 0.0f;
+        static int currentTab = 0;
+        static bool aimBindingActive = false;
 
-            ImGui::Checkbox("Enable Cheat", &g_config.enabled);
-            ImGui::Checkbox("NoFlash", &g_config.noFlash);
-            ImGui::Checkbox("NoSmoke", &g_config.noSmoke);
-            ImGui::Checkbox("Show Distance", &g_config.showDistance);
+        if (g_config.showMenu && menuAlpha < 1.0f) {
+            menuAlpha += 0.05f;
+            if (menuAlpha > 1.0f) menuAlpha = 1.0f;
+        }
+        else if (!g_config.showMenu && menuAlpha > 0.0f) {
+            menuAlpha -= 0.05f;
+            if (menuAlpha < 0.0f) menuAlpha = 0.0f;
+        }
+
+        if (menuAlpha > 0.01f) {
+            ImGui::PushStyleVar(ImGuiStyleVar_Alpha, menuAlpha);
+
+            const char* tabs[] = { ICON_FA_CROSSHAIRS " Aimbot", ICON_FA_EYE " Visuals", ICON_FA_SAVE " Config" };
+
+            ImGui::SetNextWindowSize(ImVec2(620, 480), ImGuiCond_FirstUseEver);
+            ImGui::Begin("rakhus-cs2", &g_config.showMenu,
+                ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize);
+
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.7f, 1.0f, 1.0f));
+            ImGui::Text("RAKHUS CS2");
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "| internal cheat");
             ImGui::Separator();
 
-            ImGui::Checkbox("No Visual Recoil", &g_config.noVisualRecoil);
-            ImGui::Checkbox("Spectator List", &g_config.spectatorList);
-            ImGui::Checkbox("Hitmarker", &g_config.hitmarker);
-            ImGui::Checkbox("FOV Circle", &g_config.fovCircle);
-
-            ImGui::Separator();
-            ImGui::SliderFloat("Aim Radius", &g_config.aimRadius, 0.0f, 100.0f, "%.1f px");
-            ImGui::SliderFloat("Smoothness", &g_config.smoothness, 0.0f, 1.0f, "%.2f");
-
-            static bool bindingActive = false;
-            if (bindingActive) {
-                ImGui::Text("Press any key or mouse button...");
-                for (int key = 0x01; key <= 0xFF; key++) {
-                    if (GetAsyncKeyState(key) & 0x8000) { g_config.aimKey = key; bindingActive = false; SaveConfig(); break; }
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(2, 0));
+            for (int i = 0; i < IM_ARRAYSIZE(tabs); i++) {
+                if (i > 0) ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Button, (i == currentTab) ?
+                    ImVec4(0.2f, 0.3f, 0.5f, 0.8f) : ImVec4(0.1f, 0.1f, 0.15f, 0.6f));
+                if (ImGui::Button(tabs[i], ImVec2(120, 30))) {
+                    currentTab = i;
                 }
-                if (GetAsyncKeyState(VK_RBUTTON) & 0x8000) { g_config.aimKey = VK_RBUTTON; bindingActive = false; SaveConfig(); }
-                if (GetAsyncKeyState(VK_MBUTTON) & 0x8000) { g_config.aimKey = VK_MBUTTON; bindingActive = false; SaveConfig(); }
-                if (GetAsyncKeyState(VK_XBUTTON1) & 0x8000) { g_config.aimKey = VK_XBUTTON1; bindingActive = false; SaveConfig(); }
-                if (GetAsyncKeyState(VK_XBUTTON2) & 0x8000) { g_config.aimKey = VK_XBUTTON2; bindingActive = false; SaveConfig(); }
+                ImGui::PopStyleColor();
             }
-            else {
-                char keyName[64];
-                if (g_config.aimKey >= 0x01 && g_config.aimKey <= 0x07) {
-                    const char* mouseNames[] = { "Left","Right","Middle","X1","X2" };
-                    int idx = g_config.aimKey - 1;
-                    if (idx >= 0 && idx < 5) sprintf_s(keyName, "Mouse %s", mouseNames[idx]);
-                    else sprintf_s(keyName, "Mouse %d", g_config.aimKey);
+            ImGui::PopStyleVar();
+            ImGui::Separator();
+
+            switch (currentTab) {
+            case 0: // Aimbot
+                ImGui::BeginChild("AimbotContent", ImVec2(0, 0), true);
+                ImGui::Checkbox("Enable Aimbot", &g_config.enabled);
+                ImGui::SliderFloat("Aim Radius", &g_config.aimRadius, 0.0f, 100.0f, "%.1f px");
+                ImGui::SliderFloat("Smoothness", &g_config.smoothness, 0.0f, 1.0f, "%.2f");
+                if (aimBindingActive) {
+                    ImGui::Text("Press any key or mouse button...");
+                    for (int key = 0x01; key <= 0xFF; key++) {
+                        if (GetAsyncKeyState(key) & 0x8000) { g_config.aimKey = key; aimBindingActive = false; SaveConfig(); break; }
+                    }
+                    if (GetAsyncKeyState(VK_RBUTTON) & 0x8000) { g_config.aimKey = VK_RBUTTON; aimBindingActive = false; SaveConfig(); }
+                    if (GetAsyncKeyState(VK_MBUTTON) & 0x8000) { g_config.aimKey = VK_MBUTTON; aimBindingActive = false; SaveConfig(); }
+                    if (GetAsyncKeyState(VK_XBUTTON1) & 0x8000) { g_config.aimKey = VK_XBUTTON1; aimBindingActive = false; SaveConfig(); }
+                    if (GetAsyncKeyState(VK_XBUTTON2) & 0x8000) { g_config.aimKey = VK_XBUTTON2; aimBindingActive = false; SaveConfig(); }
                 }
                 else {
-                    UINT scanCode = MapVirtualKey(g_config.aimKey, MAPVK_VK_TO_VSC);
-                    char name[64];
-                    if (GetKeyNameTextA(scanCode << 16, name, sizeof(name)) > 0) sprintf_s(keyName, "%s", name);
-                    else sprintf_s(keyName, "VK_%02X", g_config.aimKey);
+                    char keyName[64];
+                    if (g_config.aimKey >= 0x01 && g_config.aimKey <= 0x07) {
+                        const char* mouseNames[] = { "Left","Right","Middle","X1","X2" };
+                        int idx = g_config.aimKey - 1;
+                        if (idx >= 0 && idx < 5) sprintf_s(keyName, "Mouse %s", mouseNames[idx]);
+                        else sprintf_s(keyName, "Mouse %d", g_config.aimKey);
+                    }
+                    else {
+                        UINT scanCode = MapVirtualKey(g_config.aimKey, MAPVK_VK_TO_VSC);
+                        char name[64];
+                        if (GetKeyNameTextA(scanCode << 16, name, sizeof(name)) > 0) sprintf_s(keyName, "%s", name);
+                        else sprintf_s(keyName, "VK_%02X", g_config.aimKey);
+                    }
+                    ImGui::Text("Aim Key: %s", keyName);
+                    if (ImGui::Button("Change Key")) { aimBindingActive = true; }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Reset to F1")) { g_config.aimKey = VK_F1; SaveConfig(); }
                 }
-                ImGui::Text("Aim Key: %s", keyName);
-                if (ImGui::Button("Change Key")) { bindingActive = true; }
+                ImGui::EndChild();
+                break;
+
+            case 1: // Visuals
+                ImGui::BeginChild("VisualsContent", ImVec2(0, 0), true);
+                ImGui::Checkbox("NoFlash", &g_config.noFlash);
+                ImGui::Checkbox("NoSmoke", &g_config.noSmoke);
+                ImGui::Checkbox("No Visual Recoil", &g_config.noVisualRecoil);
+                ImGui::Checkbox("Show Distance", &g_config.showDistance);
+                ImGui::Checkbox("Spectator List", &g_config.spectatorList);
+                ImGui::Checkbox("Hitmarker", &g_config.hitmarker);
+                ImGui::Checkbox("FOV Circle", &g_config.fovCircle);
+                ImGui::ColorEdit3("ESP Color", &g_config.espColorR);
+                ImGui::EndChild();
+                break;
+
+            case 2: // Config
+                ImGui::BeginChild("ConfigContent", ImVec2(0, 0), true);
+                if (ImGui::Button(ICON_FA_SAVE " Save Config", ImVec2(120, 30))) SaveConfig();
                 ImGui::SameLine();
-                if (ImGui::Button("Reset to F1")) { g_config.aimKey = VK_F1; SaveConfig(); }
+                if (ImGui::Button(ICON_FA_PLUS " Load Config", ImVec2(120, 30))) LoadConfig();
+                ImGui::SameLine();
+                if (ImGui::Button("Reset Defaults", ImVec2(120, 30))) {
+                    g_config = Config();
+                    SaveConfig();
+                }
+                ImGui::EndChild();
+                break;
             }
 
-            ImGui::ColorEdit3("ESP Color", &g_config.espColorR);
-
-            if (ImGui::Button("Save Config")) SaveConfig();
-            ImGui::SameLine();
-            if (ImGui::Button("Load Config")) LoadConfig();
-            ImGui::SameLine();
-            if (ImGui::Button("Reset Defaults")) { g_config = Config(); SaveConfig(); }
-
             ImGui::End();
+            ImGui::PopStyleVar();
         }
         else {
+            // Minimal hint when menu is hidden
             ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
             ImGui::SetNextWindowSize(ImVec2(0, 0), ImGuiCond_Always);
             ImGui::Begin("MenuHint", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
@@ -837,11 +954,11 @@ void DrawImGuiESP() {
         }
     }
     catch (...) {
-        // Catch-all for C++ exceptions (SEH are handled separately)
+        // Catch-all for C++ exceptions
     }
 }
 
-// -------------------- D3D11 HOOK (fully protected) --------------------
+// -------------------- D3D11 HOOK --------------------
 typedef HRESULT(__stdcall* Present)(IDXGISwapChain*, UINT, UINT);
 Present oPresent = nullptr;
 
@@ -864,10 +981,35 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
                 ImGui::CreateContext();
                 ImGuiIO& io = ImGui::GetIO();
                 io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+                if (!LoadFontFromDisk()) {
+                    LOG("[-] Custom font not loaded, using default");
+                    io.Fonts->AddFontDefault();
+                }
+
+                if (!io.Fonts->Build()) {
+                    LOG("[-] Font atlas Build() failed, forcing default font");
+                    io.Fonts->Clear();
+                    io.Fonts->AddFontDefault();
+                    io.Fonts->Build();
+                }
+
+                unsigned char* pixels;
+                int width, height;
+                io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+                if (pixels) {
+                    LOG_FMT("[+] Font texture data generated: %dx%d", width, height);
+                }
+                else {
+                    LOG("[-] GetTexDataAsRGBA32 returned null!");
+                }
+
                 SetupImGuiStyle();
 
                 ImGui_ImplWin32_Init(g_gameHwnd);
-                ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+                if (!ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext)) {
+                    LOG("[-] ImGui DX11 init failed");
+                }
 
                 g_OriginalWndProc = (WNDPROC)SetWindowLongPtr(g_gameHwnd, GWLP_WNDPROC, (LONG_PTR)HookedWndProc);
 
@@ -911,7 +1053,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        // Never crash – just return original Present
+        // Never crash
     }
 
     return oPresent(pSwapChain, SyncInterval, Flags);
@@ -930,7 +1072,6 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
 DWORD WINAPI MainLoop(LPVOID) {
     LOG("[*] Main loop started");
 
-    // Wait for client.dll
     for (int i = 0; i < 50; i++) {
         Sleep(100);
         if (HMODULE h = GetModuleHandleA("client.dll")) {
@@ -944,7 +1085,6 @@ DWORD WINAPI MainLoop(LPVOID) {
         return 0;
     }
 
-    // Hook D3D11 Present
     bool init_hook = false;
     do {
         if (kiero::init(kiero::RenderType::D3D11) == kiero::Status::Success) {
@@ -956,7 +1096,6 @@ DWORD WINAPI MainLoop(LPVOID) {
         Sleep(100);
     } while (!init_hook);
 
-    // Menu toggle loop
     static bool lastInsertState = false;
     while (true) {
         bool insertState = GetAsyncKeyState(VK_INSERT) & 0x8000;
@@ -974,7 +1113,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         g_hModule = hModule;
         DisableThreadLibraryCalls(hModule);
         InitConsole();
-        LOG("[+] rakhus-cs2-internal loaded (final stable version)");
+        LOG("[+] rakhus-cs2-internal loaded");
         CreateThread(NULL, 0, MainLoop, NULL, 0, NULL);
     }
     return TRUE;
