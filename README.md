@@ -1,174 +1,216 @@
 # rakhus-cs2-internal
 
-A small, internal "legit" cheat for Counter-Strike 2 (CS2) built with ImGui and Kiero.  
-Features include ESP (wallhack), smooth aim assist, NoFlash, and NoSmoke – all configurable via an in-game menu.
+Internal **legit** cheat for [Counter-Strike 2](https://store.steampowered.com/app/730).  
+Schema / offsets target: **build 14178** (cs2-sdk dump).
+
+Focus: smooth aim, soft RCS, natural triggerbot, ESP, bomb timer, modern ImGui menu.  
+**No rage features** (no spinbot, no silent aim, no shoot-through-walls).  
+**No skin / knife changer** (removed — was unreliable clientside).
+
+> **Educational / private use only.** Online matchmaking can result in VAC, Overwatch, or account bans. You are solely responsible for how you use this software.
 
 ---
 
-## Known Issues
+## Quick start
 
-- Spectator List doesn't work reliably.
-- Hitmarker sometimes works, sometimes doesn't.
-- No Visual Recoil is glitchy (may not fully eliminate recoil animation).
+1. Build the project (see [Build](#build)).
+2. Start CS2 and reach the main menu (or a match).
+3. Inject `rakhus.dll` into `cs2.exe` (LoadLibrary or manual-map injector).
+4. A console window titled **`rakhus-legit`** should open (pattern resolve log).
+5. Press **INSERT** to open / close the menu.
+6. Enable the features you want; settings save to **`legit.ini`**.
+
+**First inject tip:** delete any old `legit.ini` so new defaults load cleanly.
 
 ---
 
-## Fixed
+## Controls
 
-- **Aim assist** – stable, no crash.
-- **Head position** – accurate.
-- **Crash when leaving a match** – resolved.
-- **NoSmoke crash and black smoke** – **fixed**. The function now safely zeroes the local player's smoke overlay fields and disables all smoke grenade projectiles by resetting their spawn flags. All memory accesses are protected with `__try/__except`, making it stable. **No crashes experienced during extensive testing**.
-- **Immediate crash when aiming** – fixed by properly protecting view angle reads/writes with `__try/__except`.
+| Key | Action |
+|-----|--------|
+| **INSERT** | Toggle menu |
+| Aim key (default **LMB**) | Hold to aim assist |
+| Trigger key (default **Mouse 5**) | Hold to triggerbot |
+| Third-person key (default **Mouse 4**) | **Hold** for third person (release = first person) |
+
+All feature keys are rebindable in the menu (click the hex key button, then press a key).
 
 ---
 
 ## Features
 
-- **ESP (Wallhack)**
-  - Box ESP with health bar.
-  - Head indicator.
-  - Distance display (optional).
-  - Customizable ESP color.
+### Aimbot
+| Option | Description |
+|--------|-------------|
+| Enable | Smooth aim assist toward selected bone |
+| FOV | Pixel FOV radius |
+| Smooth | Higher = slower / more legit |
+| Humanize | Small random offset on the aim point |
+| Bone | Head / Neck / Chest |
+| Bone priority | Head → Neck → Chest (first bone inside FOV wins) |
+| Team check | Enemies only |
+| Visible only | Spotted targets only |
+| Only when scoped | Aim only while zoomed |
+| Draw FOV circle | On-screen FOV overlay |
+| Aim key | Hold key (default LMB) |
 
-- **Aim Assist**
-  - Smooth aiming (adjustable smoothness).
-  - Configurable aim radius (in pixels).
-  - Selectable activation key (mouse or keyboard).
+### Soft RCS
+- Partial aim-punch compensation (strength 0–1)
+- Configurable start bullet
+- **Auto-disabled while No Visual Recoil is on** (avoids camera glitches)
 
-- **NoFlash**
-  - Disables flashbang effect entirely.
+### Triggerbot
+- Crosshair entity via `m_iIDEntIndex`
+- Inter-shot delay (min/max ms) for recoil settle
+- Extra pause while spraying
+- Team check; visible-only optional (default off)
+- Rebindable hold key
 
-- **NoSmoke**
-  - Disables smoke bomb's visual effect entirely. **Stable and crash‑free**.
+### ESP
+- Box + outline, name, health, armor
+- Weapon name, distance (m)
+- Head dot, optional skeleton
+- Visible vs hidden colors
+- Max distance, team / visible filters
 
-- **In-Game Menu**
-  - Toggle with `INSERT` key.
-  - Adjust all settings on the fly.
-  - Save/Load configuration to/from `config.ini`.
+Positions use `m_vecAbsOrigin` + crouch-aware view offset. Bones only when near the body.
 
-- **Configuration**
-  - Settings persist between game sessions.
-  - Auto‑loads config on injection.
+### Glow
+- `CGlowProperty` on enemies
+- RGBA + type **0–3** (0 = outline … 3 = strongest)
 
----
+### Sound ESP
+- Edge arrows for non-visible moving enemies + distance (velocity-based)
 
-## Installation
+### Bomb timer
+- Centered `BOMB A · 12.3s` after plant
+- `m_flC4Blow` − curtime, or local countdown fallback
 
-1. **Download** – You need to build it yourself. Offsets are updated now and then.
-2. **Inject** the DLL into `cs2.exe` using your preferred injector (e.g., [Anarchy Injector](https://github.com/AnarchyLoader/AnarchyInjector)).
-3. **Launch CS2** – the cheat will automatically hook D3D11 and initialise.
-4. Press **`INSERT`** to open the settings menu.
-
-> **Note:** The cheat is designed for **internal use only**. It requires a working D3D11 renderer (CS2 uses D3D11 by default).
-
----
-
-## Usage
-
-| Key | Action |
-|-----|--------|
-| `INSERT` | Toggle settings menu |
-| *(configurable)* | Aim assist activation key (default: `F1`) |
-
-- **Aim assist** works while holding the assigned key. It will smoothly move your crosshair toward the nearest enemy's head within the aim radius.
-- **ESP** is always active when the cheat is enabled (toggleable via menu).
-- **NoFlash** is a checkbox – enable to ignore flashbangs.
-- **NoSmoke** is a checkbox – enable to make smoke completely transparent. **Works reliably without crashes.**
-
----
-
-## Configuration
-
-Settings are stored in `config.ini`, located in the same folder as the injected DLL.
-
-- The file is **auto‑loaded** on injection.
-- Use the **Save Config** / **Load Config** buttons in the menu to manage settings.
-- **Reset Defaults** restores all values to their default state.
-
-### Default Settings
-
-| Setting | Default |
-|---------|---------|
-| Cheat enabled | `true` |
-| Aim radius | `20.0` px |
-| Aim key | `F1` |
-| Smoothness | `0.8` |
-| NoFlash | `false` |
-| NoSmoke | `false` |
-| Show distance | `true` |
-| ESP color | `(0.0, 0.75, 1.0)` – blue |
+### Misc
+| Feature | Description |
+|---------|-------------|
+| No Flash | Clears flash overlay |
+| No Smoke | `smokegrenade_projectile` filter + optional DrawSmokeArray hook |
+| No Visual Recoil | Zeros aim-punch services only (no viewangle writes) |
+| Spectator list | Observer pawn / mode / target |
+| Hitmarker | Enemy HP drop + fade |
+| Custom crosshair | Size / gap / thickness / color |
+| Third person | **Hold key** (off by default). Safe CSGOInput + optional reset patch |
 
 ---
 
-## Building from Source
+## Menu tabs
 
-### Prerequisites
+| Tab | Contents |
+|-----|----------|
+| Aimbot | Aim + soft RCS |
+| Trigger | Triggerbot |
+| Visuals | ESP |
+| Misc | Flash / smoke / NVR / spectators / hitmarker / bomb / third person / sound / crosshair |
+| Glow | Enemy glow |
+| Config | Save / load |
 
-- Visual Studio 2019 or newer (with C++ development tools)
-- [CMake](https://cmake.org/)
-- Git (to clone submodules)
-
-### Steps
-
-1. **Clone the repository** with submodules:
-   ```bash
-   git clone --recursive https://github.com/Titanius69/rakhus-cs2-internal.git
-   cd rakhus-cs2-internal
-   ```
-
-2. **Open the solution** (`rakhus-cs2-internal.sln`) in Visual Studio.  
-   *(If you prefer CMake, generate project files with `cmake -B build`)*
-
-3. **Build** the project in `Release` or `Debug` configuration.  
-   The output DLL will be placed in the `out/` folder.
-
-4. **Update offsets** – the cheat relies on `offsets.h`. After each CS2 game update, refresh offsets using [CS2-Dumper](https://github.com/a2x/cs2-dumper).
+Config file: **`legit.ini`**.
 
 ---
 
-## Offset Update Guide
+## Build
 
-The cheat uses these key offsets (all in `offsets.h`):
+**Requirements:** Windows x64, VS 2022 (MSVC), CMake ≥ 3.20
 
-| Offset | Purpose |
-|--------|---------|
-| `dwLocalPlayerPawn` | Local player pawn |
-| `dwViewMatrix` | World-to-screen matrix |
-| `dwViewAngles` | Player view angles |
-| `dwGameEntitySystem` | Entity system root |
-| `m_lifeState` | Player alive state |
-| `m_iHealth` | Player health |
-| `m_iTeamNum` | Team number |
-| `m_vecOrigin` | Position |
-| `m_angEyeAngles` | Eye angles |
-| `m_pAimPunchServices` | Recoil control |
-| `m_flLastSmokeOverlayAlpha` | Smoke transparency (NoSmoke) |
-| `m_flLastSmokeAge` | Smoke age (NoSmoke) |
-| `m_vLastSmokeOverlayColor` | Smoke color (NoSmoke) |
-| `m_bSmokeEffectSpawned` | Smoke projectile spawn flag |
-| `m_bDidSmokeEffect` | Smoke effect flag |
-| `m_nSmokeEffectTickBegin` | Smoke tick counter |
+```bat
+cmake --preset x64-debug
+cmake --build --preset x64-debug
+```
+
+Output: `rakhus.dll`.
 
 ---
 
-## Credits
+## Injection
 
-- [ImGui](https://github.com/ocornut/imgui) – GUI library
-- [Kiero](https://github.com/rdbo/ImGui-DirectX-11-Kiero-Hook) – D3D11 hooking
-- [CS2-Dumper](https://github.com/a2x/cs2-dumper) – Dumping CS2 offsets
-- [CS2-SDK](https://www.cs2-sdk.com/) – CS2 SDK, some offsets come from there
+1. Run CS2  
+2. Inject `rakhus.dll` into `cs2.exe`  
+3. Check console `rakhus-legit` for pattern logs  
+4. **INSERT** → menu  
+
+If the game crashes: leave **Third person** and **No Smoke** off, re-enable one by one.
 
 ---
 
-## Disclaimer
+## Pattern scan
 
-**This project is for educational purposes only.**  
-The author does not condone or encourage cheating in online multiplayer games.  
-Using this cheat may result in a permanent ban from CS2. Use at your own risk.
+| Pattern | Use |
+|---------|-----|
+| `pViewMatrix` | View matrix (static RVA preferred for W2S) |
+| `pGameEntitySystem` | Entity system |
+| `pLocalPlayerController` | Local controller |
+| `UpdateGlobalVars` | Global vars / bomb timer |
+| `pGlowManager` | Glow |
+| `pCSGOInput` | Input + third person |
+| `DrawSmokeArray` | Optional NoSmoke hook |
+| `ThirdPersonReset` | Optional third-person patch |
+
+Fallbacks: static RVAs in `src/offsets.h`.
+
+---
+
+## Project layout
+
+```
+rakhus/
+├── CMakeLists.txt
+├── CMakePresets.json
+├── LICENSE
+├── README.md
+└── src/
+    ├── dllmain.cpp
+    ├── offsets.h
+    ├── pattern_scan.h
+    ├── imgui/
+    └── kiero/
+```
+
+---
+
+## After a game update
+
+Refresh at least:
+
+- `dwGameEntitySystem`, `dwLocalPlayerPawn`, `dwViewMatrix`, `dwViewAngles`
+- `dwGlobalVars`, `dwPlantedC4`, `dwGlowManager`
+- Pawn fields: health, team, scene node, weapon services, glow, flash/smoke, aim punch, `m_iIDEntIndex`
+
+If class layouts stay the same and only globals move, updating `dw*` is often enough.
+
+---
+
+## Known limitations
+
+1. **No Visual Recoil** — punch zeroed on Present path; tiny residual possible without CreateMove. Do not combine with Soft RCS.  
+2. **Third person** — hold-key path only; full distance needs OverrideView (not included).  
+3. **Sound ESP** — velocity-based, not real footsteps.  
+4. **Bomb timer** — curtime can drift; local countdown is fallback.  
+5. **Skeleton** — bone layout varies; falls back to origin + view offset.  
+6. **NoSmoke** — entity writes + optional draw hook; map-dependent.
+
+---
+
+## Troubleshooting
+
+| Problem | Try |
+|---------|-----|
+| No menu | Inject after main menu; INSERT; check console |
+| ESP low / shifted | Delete `legit.ini`; rebuild; check ViewMatrix log |
+| Trigger never fires | Visible only **off**; check key; raise delay |
+| NVR glitches | Soft RCS **off**; only NVR |
+| Crash on third person | Leave TP **off** |
+| Crash on smoke | Disable No Smoke |
 
 ---
 
 ## License
 
-This project is licensed under the MIT License – see the [LICENSE](LICENSE) file for details.
+See [LICENSE](LICENSE).
+
+Provided as-is, without warranty. Use at your own risk.
