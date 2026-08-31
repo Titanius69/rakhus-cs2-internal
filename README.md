@@ -9,6 +9,8 @@ Focus: smooth aim, soft RCS, natural triggerbot, ESP, bomb timer, modern ImGui m
 
 > **Educational / private use only.** Online matchmaking can result in VAC, Overwatch, or account bans. You are solely responsible for how you use this software.
 
+**[Watch the showcase video](https://youtu.be/-6PLDWjY0e4)**
+
 ---
 
 ## Quick start
