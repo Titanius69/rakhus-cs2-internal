@@ -1,7 +1,17 @@
 // ========================================================================
-// Rakhus CS2 Internal – LEGIT Edition (build 14178)
-// Smooth aim, soft RCS, triggerbot, subtle ESP, bomb timer
+// rak-hus-legit  –  CS2 Internal  (build 14178)
+// Smooth aim, soft RCS, improved triggerbot, subtle ESP, bomb timer
 // ========================================================================
+
+// -------------------- TUNABLES (edit these) --------------------
+// Head bone Z offset (world units). Positive lifts the aim/ESP point
+// toward the top of the skull. Typical useful range: 0.0 – 8.0
+// 0.0 = raw bone  |  3.5 = default sweet spot  |  6–7 = top of head
+static float g_HeadBoneZOffset = 3.5f;
+
+// Triggerbot crosshair FOV tolerance in pixels (how close head must be
+// to screen center before firing). Smaller = stricter. 0 = disable FOV check.
+static float g_TriggerFovPx = 18.f;
 
 #include <Windows.h>
 #include <Psapi.h>
@@ -21,6 +31,7 @@
 #include <d3d11.h>
 #include <dxgi.h>
 #include "imgui/imgui.h"
+#include "imgui/imgui_internal.h"
 #include "imgui/imgui_impl_win32.h"
 #include "imgui/imgui_impl_dx11.h"
 #include "offsets.h"
@@ -37,8 +48,8 @@ void InitConsole() {
     FILE* f;
     freopen_s(&f, "CONOUT$", "w", stdout);
     freopen_s(&f, "CONOUT$", "w", stderr);
-    SetConsoleTitleA("rakhus-legit");
-    printf("[+] rakhus legit console ready\n");
+    SetConsoleTitleA("rak-hus-legit");
+    printf("[+] rak-hus-legit console ready\n");
 }
 #define LOG(m)          printf("[+] %s\n", m)
 #define LOG_FMT(f, ...) printf(f, __VA_ARGS__)
@@ -70,6 +81,7 @@ static bool g_hitMarkerActive = false;
 static std::chrono::steady_clock::time_point g_hitMarkerTime;
 static std::chrono::steady_clock::time_point g_lastTrigger;
 static float g_rcsPunchX = 0.f, g_rcsPunchY = 0.f;
+static int g_localCtrlIndex = -1; // local controller entity-list slot (1..64)
 
 // -------------------- LEGIT CONFIG --------------------
 #define AIM_KEY_DEFAULT VK_LBUTTON
@@ -96,10 +108,14 @@ struct Config {
     // Triggerbot
     bool triggerEnabled = false;
     int triggerKey = TRIGGER_KEY_DEFAULT;
-    int triggerDelayMin = 90;
-    int triggerDelayMax = 160;
+    int triggerDelayMin = 45;   // ms between shots (min)
+    int triggerDelayMax = 95;   // ms between shots (max, randomized)
     bool triggerTeamCheck = true;
     bool triggerVisibleOnly = false;
+    int  triggerBone = 0;            // 0 head, 1 neck, 2 chest — only fire on this bone
+    bool triggerRcs = true;          // anti-recoil while trigger fires
+    float triggerRcsStrength = 1.0f; // 0–1 full punch compensation
+    float triggerBoneFov = 12.f;     // max pixels: bone must be this close to crosshair
 
     // ESP (subtle)
     bool espEnabled = true;
@@ -208,6 +224,10 @@ void SaveConfig() {
     w("triggerDelayMax", g_config.triggerDelayMax);
     w("triggerTeamCheck", g_config.triggerTeamCheck ? 1 : 0);
     w("triggerVisibleOnly", g_config.triggerVisibleOnly ? 1 : 0);
+    w("triggerBone", g_config.triggerBone);
+    w("triggerRcs", g_config.triggerRcs ? 1 : 0);
+    w("triggerRcsStrength", g_config.triggerRcsStrength);
+    w("triggerBoneFov", g_config.triggerBoneFov);
     w("espEnabled", g_config.espEnabled ? 1 : 0);
     w("espBox", g_config.espBox ? 1 : 0);
     w("espBoxOutline", g_config.espBoxOutline ? 1 : 0);
@@ -274,6 +294,10 @@ void LoadConfig() {
             else if (k == "triggerDelayMax") g_config.triggerDelayMax = std::stoi(v);
             else if (k == "triggerTeamCheck") g_config.triggerTeamCheck = std::stoi(v) != 0;
             else if (k == "triggerVisibleOnly") g_config.triggerVisibleOnly = std::stoi(v) != 0;
+            else if (k == "triggerBone") g_config.triggerBone = std::stoi(v);
+            else if (k == "triggerRcs") g_config.triggerRcs = std::stoi(v) != 0;
+            else if (k == "triggerRcsStrength") g_config.triggerRcsStrength = std::stof(v);
+            else if (k == "triggerBoneFov") g_config.triggerBoneFov = std::stof(v);
             else if (k == "espEnabled") g_config.espEnabled = std::stoi(v) != 0;
             else if (k == "espBox") g_config.espBox = std::stoi(v) != 0;
             else if (k == "espBoxOutline") g_config.espBoxOutline = std::stoi(v) != 0;
@@ -320,7 +344,8 @@ void LoadConfig() {
             else if (k == "soundEsp") g_config.soundEsp = std::stoi(v) != 0;
             else if (k == "soundMinSpeed") g_config.soundMinSpeed = std::stof(v);
             else if (k == "soundMaxDist") g_config.soundMaxDist = std::stof(v);
-        } catch (...) {}
+        }
+        catch (...) {}
     }
 }
 
@@ -346,10 +371,8 @@ static void SafeReadArray(uintptr_t address, char* buffer, size_t maxLen) {
         const char* p = (const char*)address;
         for (size_t i = 0; i < maxLen - 1; i++) { buffer[i] = p[i]; if (!p[i]) break; }
         buffer[maxLen - 1] = 0;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { buffer[0] = 0; }
-}
-static bool IsAlive(uintptr_t pawn) {
-    return IsValid(pawn) && SafeRead<uint8_t>(pawn + O::m_lifeState, 1) == 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { buffer[0] = 0; }
 }
 static bool IsKeyDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
@@ -367,24 +390,117 @@ static uintptr_t GetEntity(int idx) {
         uintptr_t identity = chunk + (idx % O::kChunk) * O::kStride;
         uintptr_t ent = SafeRead<uintptr_t>(identity, 0);
         return IsValid(ent) ? ent : 0;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
 static uintptr_t HandleToEnt(uint32_t h) {
-    if (!h || h == 0xFFFFFFFF) return 0;
-    return GetEntity(h & 0x7FFF);
+    if (!h || h == 0xFFFFFFFF || h == 0xFFFFFF) return 0;
+    int idx = (int)(h & 0x7FFF);
+    if (idx <= 0 || idx > 0x7FFE) return 0;
+    return GetEntity(idx);
 }
-static int HP(uintptr_t e) { return SafeRead<int>(e + O::m_iHealth, 0); }
-static int Team(uintptr_t e) { return SafeRead<uint8_t>(e + O::m_iTeamNum, 0); }
-static int Armor(uintptr_t e) { return SafeRead<int>(e + O::m_ArmorValue, 0); }
+static int HP(uintptr_t e) {
+    if (!IsValid(e)) return 0;
+    int v = SafeRead<int>(e + O::m_iHealth, 0);
+    if (v < 0 || v > 200) return 0;
+    return v;
+}
+static int Team(uintptr_t e) {
+    if (!IsValid(e)) return 0;
+    return (int)SafeRead<uint8_t>(e + O::m_iTeamNum, 0);
+}
+static int Armor(uintptr_t e) {
+    if (!IsValid(e)) return 0;
+    int v = SafeRead<int>(e + O::m_ArmorValue, 0);
+    if (v < 0 || v > 200) return 0;
+    return v;
+}
+
+// Forward decls used by IsAlive / cache
+static Vector3 GetOrigin(uintptr_t pawn);
+static Vector3 GetViewOffset(uintptr_t pawn);
+static int ResolveLocalControllerIndex(uintptr_t localPawn);
+
+static bool IsDormant(uintptr_t pawn) {
+    if (!IsValid(pawn)) return true;
+    uintptr_t sn = SafeRead<uintptr_t>(pawn + O::m_pGameSceneNode, 0);
+    if (!IsValid(sn)) return true;
+    return SafeRead<uint8_t>(sn + O::m_bDormant, 1) != 0;
+}
+
+static bool OriginSane(const Vector3& o) {
+    if (!std::isfinite(o.x) || !std::isfinite(o.y) || !std::isfinite(o.z)) return false;
+    if (fabsf(o.x) < 1.f && fabsf(o.y) < 1.f && fabsf(o.z) < 1.f) return false;
+    if (fabsf(o.x) > 16384.f || fabsf(o.y) > 16384.f || fabsf(o.z) > 2048.f) return false;
+    return true;
+}
+
+static bool IsAlive(uintptr_t pawn) {
+    if (!IsValid(pawn)) return false;
+    if (SafeRead<uint8_t>(pawn + O::m_lifeState, 1) != 0) return false;
+    int hp = HP(pawn);
+    if (hp <= 0 || hp > 100) return false;
+    int team = Team(pawn);
+    if (team != 2 && team != 3) return false;
+    if (IsDormant(pawn)) return false;
+    return true;
+}
+
+static bool ControllerPawnAlive(uintptr_t ctrl) {
+    if (!IsValid(ctrl)) return false;
+    return SafeRead<uint8_t>(ctrl + O::m_bPawnIsAlive, 0) != 0;
+}
+
+static bool IsInGame() {
+    if (!hClient || !IsValid(hClient)) return false;
+    if (!g_pES || !IsValid(g_pES)) return false;
+    uintptr_t lc = SafeRead<uintptr_t>(hClient + O::dwLocalPlayerController, 0);
+    if (!IsValid(lc)) return false;
+    uintptr_t lp = SafeRead<uintptr_t>(hClient + O::dwLocalPlayerPawn, 0);
+    return IsValid(lp);
+}
 
 void RefreshEntityCache() {
     g_cacheTick++;
-    if ((g_cacheTick % 2) != 0 && g_cacheCount > 0) return;
+
+    if (!IsInGame()) {
+        g_cacheCount = 0;
+        g_localCtrlIndex = -1;
+        memset(g_cache, 0, sizeof(g_cache));
+        return;
+    }
+
+    // Every-frame refresh (visibility index must not lag)
+    uintptr_t localCtrl = SafeRead<uintptr_t>(hClient + O::dwLocalPlayerController, 0);
+    uintptr_t localPawn = SafeRead<uintptr_t>(hClient + O::dwLocalPlayerPawn, 0);
+
+    // Prefer handle-based slot (matches SpottedByMask bit indexing)
+    g_localCtrlIndex = ResolveLocalControllerIndex(localPawn);
+    if (g_localCtrlIndex < 1 && IsValid(localCtrl)) {
+        for (int i = 1; i <= 64; i++) {
+            if (GetEntity(i) == localCtrl) { g_localCtrlIndex = i; break; }
+        }
+    }
+
     int n = 0;
     for (int i = 1; i <= 64 && n < 64; i++) {
         uintptr_t ctrl = GetEntity(i);
         if (!IsValid(ctrl)) continue;
-        uintptr_t pawn = HandleToEnt(SafeRead<uint32_t>(ctrl + O::m_hPlayerPawn, 0));
+        if (localCtrl && ctrl == localCtrl && g_localCtrlIndex < 1)
+            g_localCtrlIndex = i;
+
+        // Drop disconnected controllers (ghost ESP source)
+        if (ctrl != localCtrl && !ControllerPawnAlive(ctrl))
+            continue;
+
+        uint32_t hPawn = SafeRead<uint32_t>(ctrl + O::m_hPlayerPawn, 0);
+        uintptr_t pawn = HandleToEnt(hPawn);
+        if (ctrl != localCtrl) {
+            if (!IsValid(pawn) || !IsAlive(pawn)) continue;
+            Vector3 o = GetOrigin(pawn);
+            if (!OriginSane(o)) continue;
+        }
+
         CachedPlayer& c = g_cache[n++];
         c.ctrl = ctrl; c.pawn = pawn; c.index = i;
         c.alive = IsValid(pawn) && IsAlive(pawn);
@@ -404,7 +520,8 @@ static Vector3 GetOrigin(uintptr_t pawn) {
         o.x = *(float*)(sn + O::m_vecAbsOrigin);
         o.y = *(float*)(sn + O::m_vecAbsOrigin + 4);
         o.z = *(float*)(sn + O::m_vecAbsOrigin + 8);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
     return o;
 }
 static Vector3 GetViewOffset(uintptr_t pawn) {
@@ -414,7 +531,8 @@ static Vector3 GetViewOffset(uintptr_t pawn) {
         o.x = *(float*)(pawn + O::m_vecViewOffset);
         o.y = *(float*)(pawn + O::m_vecViewOffset + 4);
         o.z = *(float*)(pawn + O::m_vecViewOffset + 8);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
     return o;
 }
 
@@ -432,16 +550,21 @@ static bool GetBonePos(uintptr_t pawn, int boneIdx, Vector3& out) {
         headZ = (vo.z > 8.f) ? vo.z : 54.f;
 
     // Reliable approx (works rotated + crouched) — used as default for head/neck
+    // Head uses g_HeadBoneZOffset (tunable at top of file)
     Vector3 approx = origin;
     if (boneIdx == O::Bone::head || boneIdx == 6) {
-        approx.z = origin.z + headZ + 4.f; // slight lift so ESP sits on skull not forehead-down
-    } else if (boneIdx == O::Bone::neck || boneIdx == 5) {
+        approx.z = origin.z + headZ + g_HeadBoneZOffset;
+    }
+    else if (boneIdx == O::Bone::neck || boneIdx == 5) {
         approx.z = origin.z + headZ * 0.82f;
-    } else if (boneIdx == O::Bone::spine || boneIdx == 4) {
+    }
+    else if (boneIdx == O::Bone::spine || boneIdx == 4) {
         approx.z = origin.z + headZ * 0.55f;
-    } else if (boneIdx == O::Bone::pelvis || boneIdx == 0) {
+    }
+    else if (boneIdx == O::Bone::pelvis || boneIdx == 0) {
         approx.z = origin.z + 12.f;
-    } else {
+    }
+    else {
         approx.z = origin.z + headZ * 0.4f;
     }
 
@@ -453,28 +576,36 @@ static bool GetBonePos(uintptr_t pawn, int boneIdx, Vector3& out) {
         boneArray = SafeRead<uintptr_t>(sn + 0x1E0, 0);
     if (!IsValid(boneArray)) { out = approx; return true; }
 
+    auto applyHeadOffset = [&](float& x, float& y, float& z) {
+        // Lift head bone toward top of skull using tunable
+        if (boneIdx == O::Bone::head || boneIdx == 6)
+            z += g_HeadBoneZOffset;
+        out.x = x; out.y = y; out.z = z;
+        };
+
     __try {
         // CS2 bone_data: 32 bytes, world position at +0
         float x = *(float*)(boneArray + boneIdx * 32 + 0);
         float y = *(float*)(boneArray + boneIdx * 32 + 4);
         float z = *(float*)(boneArray + boneIdx * 32 + 8);
         float dx = x - origin.x, dy = y - origin.y, dz = z - origin.z;
-        float dist2 = dx*dx + dy*dy + dz*dz;
+        float dist2 = dx * dx + dy * dy + dz * dz;
         // Bone must sit near the body (rejects wrong stride / stale matrices when rotated)
         if (dist2 > 1.f && dist2 < 95.f * 95.f) {
-            out.x = x; out.y = y; out.z = z;
+            applyHeadOffset(x, y, z);
             return true;
         }
         // matrix3x4 48-byte fallback
         float* m48 = (float*)(boneArray + boneIdx * 48);
         x = m48[3]; y = m48[7]; z = m48[11];
         dx = x - origin.x; dy = y - origin.y; dz = z - origin.z;
-        dist2 = dx*dx + dy*dy + dz*dz;
+        dist2 = dx * dx + dy * dy + dz * dz;
         if (dist2 > 1.f && dist2 < 95.f * 95.f) {
-            out.x = x; out.y = y; out.z = z;
+            applyHeadOffset(x, y, z);
             return true;
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
 
     out = approx;
     return true;
@@ -482,9 +613,9 @@ static bool GetBonePos(uintptr_t pawn, int boneIdx, Vector3& out) {
 
 static int AimBoneIndex() {
     switch (g_config.aimBone) {
-        case 1: return O::Bone::neck;
-        case 2: return O::Bone::spine;
-        default: return O::Bone::head;
+    case 1: return O::Bone::neck;
+    case 2: return O::Bone::spine;
+    default: return O::Bone::head;
     }
 }
 
@@ -492,24 +623,134 @@ static float viewMatrix[16];
 bool WorldToScreen(const Vector3& world, Vector2& screen, int sw, int sh) {
     __try {
         // Row-major view-projection (cs2-dumper dwViewMatrix)
-        float cx = viewMatrix[0]*world.x + viewMatrix[1]*world.y + viewMatrix[2]*world.z + viewMatrix[3];
-        float cy = viewMatrix[4]*world.x + viewMatrix[5]*world.y + viewMatrix[6]*world.z + viewMatrix[7];
-        float cw = viewMatrix[12]*world.x + viewMatrix[13]*world.y + viewMatrix[14]*world.z + viewMatrix[15];
+        float cx = viewMatrix[0] * world.x + viewMatrix[1] * world.y + viewMatrix[2] * world.z + viewMatrix[3];
+        float cy = viewMatrix[4] * world.x + viewMatrix[5] * world.y + viewMatrix[6] * world.z + viewMatrix[7];
+        float cw = viewMatrix[12] * world.x + viewMatrix[13] * world.y + viewMatrix[14] * world.z + viewMatrix[15];
         if (cw < 0.001f) return false;
         float inv = 1.f / cw;
         screen.x = (sw * 0.5f) + (cx * inv) * (sw * 0.5f);
         screen.y = (sh * 0.5f) - (cy * inv) * (sh * 0.5f);
         return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 static void GetPlayerName(uintptr_t ctrl, char* buf, size_t len) {
     buf[0] = 0;
     if (IsValid(ctrl)) SafeReadArray(ctrl + O::m_iszPlayerName, buf, len);
 }
-static bool IsSpotted(uintptr_t pawn) {
-    return IsValid(pawn) && SafeRead<uint8_t>(pawn + O::m_entitySpottedState + O::Spotted::m_bSpotted, 0) != 0;
+
+// CS2 EntitySpottedState_t::m_bSpottedByMask = uint32[2]
+// Slot bits are 0-based: controller entity index - 1
+static bool SpottedMaskBit(uint32_t mask0, uint32_t mask1, int zeroBasedSlot) {
+    if (zeroBasedSlot < 0 || zeroBasedSlot >= 64) return false;
+    if (zeroBasedSlot < 32) return (mask0 & (1u << zeroBasedSlot)) != 0;
+    return (mask1 & (1u << (zeroBasedSlot - 32))) != 0;
 }
+
+static void ReadSpottedMask(uintptr_t pawn, uint32_t& mask0, uint32_t& mask1) {
+    uint64_t m64 = SafeRead<uint64_t>(pawn + O::m_entitySpottedState + O::Spotted::m_bSpottedByMask, 0);
+    mask0 = (uint32_t)(m64 & 0xFFFFFFFFu);
+    mask1 = (uint32_t)(m64 >> 32);
+    if (mask0 == 0 && mask1 == 0) {
+        mask0 = SafeRead<uint32_t>(pawn + O::m_entitySpottedState + O::Spotted::m_bSpottedByMask, 0);
+        mask1 = SafeRead<uint32_t>(pawn + O::m_entitySpottedState + O::Spotted::m_bSpottedByMask + 4, 0);
+    }
+}
+
+static int ResolveLocalControllerIndex(uintptr_t localPawn) {
+    if (IsValid(localPawn)) {
+        uint32_t hCtrl = SafeRead<uint32_t>(localPawn + O::m_hController, 0);
+        int idx = (int)(hCtrl & 0x7FFF);
+        if (idx >= 1 && idx <= 64) return idx;
+    }
+    if (hClient) {
+        uintptr_t lc = SafeRead<uintptr_t>(hClient + O::dwLocalPlayerController, 0);
+        if (IsValid(lc)) {
+            for (int i = 1; i <= 64; i++) {
+                if (GetEntity(i) == lc) return i;
+            }
+        }
+    }
+    return g_localCtrlIndex;
+}
+
+// Sticky hold after positive LOS — engine mask flickers / lags
+static uint64_t g_visStickyUntil[65] = {};
+
+static int VisStickyKey(uintptr_t pawn) {
+    for (int i = 0; i < g_cacheCount; i++) {
+        if (g_cache[i].pawn == pawn && g_cache[i].index >= 1 && g_cache[i].index <= 64)
+            return g_cache[i].index;
+    }
+    return (int)((pawn >> 6) % 64) + 1;
+}
+
+static bool IsCrosshairOnPawn(uintptr_t localPawn, uintptr_t target) {
+    if (!IsValid(localPawn) || !IsValid(target)) return false;
+    int cross = SafeRead<int>(localPawn + O::m_iIDEntIndex, -1);
+    if (cross <= 0 || cross > 0x7FFE) return false;
+    uintptr_t ent = GetEntity(cross);
+    if (!IsValid(ent)) return false;
+    if (ent == target) return true;
+    uintptr_t maybe = HandleToEnt(SafeRead<uint32_t>(ent + O::m_hPlayerPawn, 0));
+    return maybe == target;
+}
+
+// Instant signals only (no sticky)
+static bool IsSpottedRaw(uintptr_t pawn) {
+    if (!IsValid(pawn)) return false;
+
+    uintptr_t lp = hClient ? SafeRead<uintptr_t>(hClient + O::dwLocalPlayerPawn, 0) : 0;
+    int localIdx = ResolveLocalControllerIndex(lp);
+    if (localIdx >= 1 && localIdx <= 64)
+        g_localCtrlIndex = localIdx;
+
+    uint32_t mask0 = 0, mask1 = 0;
+    ReadSpottedMask(pawn, mask0, mask1);
+
+    if (localIdx >= 1 && localIdx <= 64) {
+        if (SpottedMaskBit(mask0, mask1, localIdx - 1)) return true;
+        if (SpottedMaskBit(mask0, mask1, localIdx)) return true;
+    }
+
+    // Crosshair on target — no engine delay
+    if (IsCrosshairOnPawn(lp, pawn)) return true;
+
+    // Faster acquire: team m_bSpotted ONLY if head is on-screen (facing them)
+    bool teamSpotted = SafeRead<uint8_t>(pawn + O::m_entitySpottedState + O::Spotted::m_bSpotted, 0) != 0;
+    if (teamSpotted && g_imGuiInitialized && IsValid(lp)) {
+        Vector3 head{};
+        if (GetBonePos(pawn, O::Bone::head, head) && OriginSane(head)) {
+            int sw = (int)ImGui::GetIO().DisplaySize.x;
+            int sh = (int)ImGui::GetIO().DisplaySize.y;
+            Vector2 scr{};
+            if (sw > 0 && sh > 0 && WorldToScreen(head, scr, sw, sh)) {
+                if (scr.x > 0.f && scr.x < (float)sw && scr.y > 0.f && scr.y < (float)sh)
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Aim / trigger / ESP visibility — sticky ~280ms to kill flicker & dropouts
+static bool IsSpotted(uintptr_t pawn) {
+    if (!IsValid(pawn)) return false;
+    const uint64_t now = GetTickCount64();
+    const int key = VisStickyKey(pawn);
+    const uint64_t stickyMs = 280;
+
+    if (IsSpottedRaw(pawn)) {
+        if (key >= 1 && key <= 64)
+            g_visStickyUntil[key] = now + stickyMs;
+        return true;
+    }
+    if (key >= 1 && key <= 64 && g_visStickyUntil[key] > now)
+        return true;
+    return false;
+}
+
 static uintptr_t GetActiveWeapon(uintptr_t pawn) {
     if (!IsValid(pawn)) return 0;
     uintptr_t ws = SafeRead<uintptr_t>(pawn + O::m_pWeaponServices, 0);
@@ -562,7 +803,8 @@ static void SetThirdPersonResetPatch(bool enable) {
                     break;
                 }
             }
-        } __except (EXCEPTION_EXECUTE_HANDLER) { jeAddr = 0; }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { jeAddr = 0; }
         if (!jeAddr) return;
     }
 
@@ -576,14 +818,16 @@ static void SetThirdPersonResetPatch(bool enable) {
             *(uint8_t*)jeAddr = 0xEB; // JMP — skip reset-to-firstperson
             VirtualProtect((void*)jeAddr, 1, old, &old);
             patched = true;
-        } else if (!enable && patched) {
+        }
+        else if (!enable && patched) {
             DWORD old = 0;
             if (!VirtualProtect((void*)jeAddr, 1, PAGE_EXECUTE_READWRITE, &old)) return;
             *(uint8_t*)jeAddr = original;
             VirtualProtect((void*)jeAddr, 1, old, &old);
             patched = false;
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
         patched = false;
         jeAddr = 0;
     }
@@ -610,7 +854,8 @@ void DoThirdPerson(uintptr_t localPawn) {
     // Only the commonly reported thirdperson bool; SEH guarded
     __try {
         SafeWrite<uint8_t>(input + 0x229, hold ? 1 : 0);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
 void DoNoFlash(uintptr_t p) {
@@ -635,7 +880,8 @@ static uintptr_t GetIdentityPtr(int idx) {
         uintptr_t chunk = SafeRead<uintptr_t>(listPtr + (idx / O::kChunk) * 8, 0);
         if (!IsValid(chunk)) return 0;
         return chunk + (idx % O::kChunk) * O::kStride;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
 
 static bool DesignerNameEquals(uintptr_t identity, const char* want) {
@@ -654,7 +900,7 @@ static bool DesignerNameEquals(uintptr_t identity, const char* want) {
 }
 
 void DoNoSmoke(uintptr_t p) {
-    if (!g_config.noSmoke) return;
+    if (!g_config.noSmoke || !IsInGame()) return;
 
     // Local overlay (screen fog when inside smoke) — safe on player pawn
     if (IsValid(p)) {
@@ -667,7 +913,7 @@ void DoNoSmoke(uintptr_t p) {
     if (oSmokeDrawArray)
         return;
 
-    if (!g_pES) return;
+    if (!g_pES || !IsValid(g_pES)) return;
 
     // Fallback: memory path (entity-name filtered) when hook missing
     static int smokeTick = 0;
@@ -709,7 +955,7 @@ void DoNoVisualRecoil(uintptr_t p) {
         SafeWrite<float>(punch + off + 0, 0.f);
         SafeWrite<float>(punch + off + 4, 0.f);
         SafeWrite<float>(punch + off + 8, 0.f);
-    };
+        };
     zero_qangle(O::AimPunch::m_predictableBaseAngle);     // 0x50
     zero_qangle(O::AimPunch::m_predictableBaseAngleVel);  // 0x5C
     zero_qangle(O::AimPunch::m_unpredictableBaseAngle);   // 0xA4
@@ -756,52 +1002,167 @@ void DoSoftRCS(uintptr_t localPawn) {
         if (cur.x > 89.f) cur.x = 89.f;
         if (cur.x < -89.f) cur.x = -89.f;
         *(Vector3*)va = cur;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// Trigger bone index (same mapping as aimbot)
+static int TriggerBoneIndex() {
+    switch (g_config.triggerBone) {
+    case 1: return O::Bone::neck;
+    case 2: return O::Bone::spine;
+    default: return O::Bone::head;
+    }
+}
+
+// Apply punch compensation so the bullet path hits bonePos (CS2: visual punch ≈ *2)
+static void TriggerApplyRcsToBone(uintptr_t localPawn, const Vector3& bonePos) {
+    if (!g_config.triggerRcs || !hClient) return;
+    if (g_config.noVisualRecoil) return; // NVR already zeros punch
+
+    Vector3 eye = GetOrigin(localPawn);
+    Vector3 vo = GetViewOffset(localPawn);
+    eye.x += vo.x; eye.y += vo.y; eye.z += vo.z;
+    if (!OriginSane(eye) || !OriginSane(bonePos)) return;
+
+    Vector3 punch{};
+    uintptr_t punchSvc = SafeRead<uintptr_t>(localPawn + O::m_pAimPunchServices, 0);
+    if (IsValid(punchSvc))
+        punch = SafeRead<Vector3>(punchSvc + O::AimPunch::m_predictableBaseAngle, {});
+
+    // Angle to bone
+    Vector3 delta{ bonePos.x - eye.x, bonePos.y - eye.y, bonePos.z - eye.z };
+    float hyp = sqrtf(delta.x * delta.x + delta.y * delta.y);
+    if (hyp < 0.001f) return;
+    Vector3 targetAng;
+    targetAng.x = -atan2f(delta.z, hyp) * (180.f / 3.14159265f);
+    targetAng.y = atan2f(delta.y, delta.x) * (180.f / 3.14159265f);
+    targetAng.z = 0.f;
+
+    // Bullet travels along view + punch*2 → aim at bone - punch*2 * strength
+    float s = (std::clamp)(g_config.triggerRcsStrength, 0.f, 1.f);
+    targetAng.x -= punch.x * 2.f * s;
+    targetAng.y -= punch.y * 2.f * s;
+
+    if (targetAng.x > 89.f) targetAng.x = 89.f;
+    if (targetAng.x < -89.f) targetAng.x = -89.f;
+    while (targetAng.y > 180.f) targetAng.y -= 360.f;
+    while (targetAng.y < -180.f) targetAng.y += 360.f;
+
+    uintptr_t va = hClient + O::dwViewAngles;
+    if (!IsValid(va)) return;
+    __try {
+        if (!std::isnan(targetAng.x) && !std::isnan(targetAng.y))
+            *(Vector3*)va = targetAng;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
 void DoTriggerbot(uintptr_t localPawn, int localTeam) {
-    if (!g_config.triggerEnabled || !IsValid(localPawn) || !IsAlive(localPawn)) return;
-    if (!IsKeyDown(g_config.triggerKey)) return;
+    // ---- State machine (no threads) ----
+    static bool     attackHeld = false;
+    static auto     pressTime = std::chrono::steady_clock::now();
+    static auto     lastShotTime = std::chrono::steady_clock::now();
+    static int      nextDelayMs = 90;
+    static int      holdMs = 30;
+    static uintptr_t holdTarget = 0; // keep RCS on same target while attack held
 
-    // m_iIDEntIndex is the entity index under crosshair (pawn/entity)
+    auto now = std::chrono::steady_clock::now();
+    auto msSince = [](const std::chrono::steady_clock::time_point& tp) {
+        return (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - tp).count();
+        };
+
+    // While attack is held: keep RCS locked on bone, then release
+    if (attackHeld) {
+        if (g_config.triggerRcs && IsValid(holdTarget) && IsAlive(holdTarget) && IsValid(localPawn)) {
+            Vector3 bonePos;
+            if (GetBonePos(holdTarget, TriggerBoneIndex(), bonePos))
+                TriggerApplyRcsToBone(localPawn, bonePos);
+        }
+        if (msSince(pressTime) >= holdMs) {
+            if (hClient) SafeWrite<int>(hClient + O::attack, 256);
+            attackHeld = false;
+            holdTarget = 0;
+        }
+        return;
+    }
+
+    if (!g_config.triggerEnabled || !IsInGame()) return;
+    if (!IsValid(localPawn) || !IsAlive(localPawn)) return;
+    if (!IsKeyDown(g_config.triggerKey)) return;
+    if (!hClient) return;
+
+    float flash = SafeRead<float>(localPawn + O::m_flFlashDuration, 0.f);
+    if (flash > 0.4f) return;
+    if (msSince(lastShotTime) < nextDelayMs) return;
+
+    // ---- Entity under crosshair ----
     int cross = SafeRead<int>(localPawn + O::m_iIDEntIndex, -1);
     if (cross <= 0 || cross > 0x7FFE) return;
 
-    uintptr_t target = GetEntity(cross);
-    // Sometimes index points at controller — try pawn handle
-    if (!IsValid(target) || !IsAlive(target)) {
-        uintptr_t maybePawn = HandleToEnt(SafeRead<uint32_t>(target + O::m_hPlayerPawn, 0));
+    uintptr_t ent = GetEntity(cross);
+    if (!IsValid(ent)) return;
+
+    uintptr_t target = ent;
+    if (!IsAlive(target)) {
+        uint32_t hPawn = SafeRead<uint32_t>(ent + O::m_hPlayerPawn, 0);
+        uintptr_t maybePawn = HandleToEnt(hPawn);
         if (IsValid(maybePawn) && IsAlive(maybePawn))
             target = maybePawn;
         else
             return;
     }
-    if (!IsValid(target) || !IsAlive(target)) return;
+
+    if (!IsValid(target) || !IsAlive(target) || target == localPawn) return;
+    if (HP(target) <= 0) return;
     if (g_config.triggerTeamCheck && Team(target) == localTeam) return;
-    // visible-only is optional; default off recommended for reliability
     if (g_config.triggerVisibleOnly && !IsSpotted(target)) return;
 
-    // Inter-shot pause so spray/recoil can settle (legit)
-    static auto lastShot = std::chrono::steady_clock::now();
-    auto now = std::chrono::steady_clock::now();
+    // ---- REQUIRED: selected bone must be under crosshair ----
+    Vector3 bonePos;
+    if (!GetBonePos(target, TriggerBoneIndex(), bonePos)) return;
+    if (!OriginSane(bonePos)) return;
+
+    int sw = 0, sh = 0;
+    if (g_imGuiInitialized) {
+        sw = (int)ImGui::GetIO().DisplaySize.x;
+        sh = (int)ImGui::GetIO().DisplaySize.y;
+    }
+    if (sw <= 0 || sh <= 0) return;
+
+    Vector2 scr;
+    if (!WorldToScreen(bonePos, scr, sw, sh)) return;
+
+    float dx = scr.x - sw * 0.5f;
+    float dy = scr.y - sh * 0.5f;
+    float distPx = sqrtf(dx * dx + dy * dy);
+
+    // Use menu FOV; fall back to file tunable if needed
+    float maxFov = g_config.triggerBoneFov;
+    if (maxFov < 1.f) maxFov = g_TriggerFovPx;
+    if (maxFov < 1.f) maxFov = 12.f;
+    if (distPx > maxFov) return; // not on the bone → don't shoot
+
+    // ---- Anti-recoil: aim through punch so bullet hits the bone ----
+    if (g_config.triggerRcs)
+        TriggerApplyRcsToBone(localPawn, bonePos);
+
+    // ---- Fire ----
+    SafeWrite<int>(hClient + O::attack, 65537);
+    attackHeld = true;
+    holdTarget = target;
+    pressTime = now;
+    lastShotTime = now;
+    holdMs = 22 + (rand() % 28);
+
     int delay = g_config.triggerDelayMin;
     if (g_config.triggerDelayMax > g_config.triggerDelayMin)
         delay = g_config.triggerDelayMin + (rand() % (g_config.triggerDelayMax - g_config.triggerDelayMin + 1));
-    // Extra pause while already spraying (shots fired)
     int shots = SafeRead<int>(localPawn + O::m_iShotsFired, 0);
     if (shots >= 2)
-        delay += 40 + shots * 8; // more pause deeper into spray
-    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastShot).count() < delay)
-        return;
-    lastShot = now;
-
-    if (!hClient) return;
-    // Short click, then mandatory release — next shot waits for delay above
-    SafeWrite<int>(hClient + O::attack, 65537);
-    std::thread([]() {
-        Sleep(25 + rand() % 20);
-        if (hClient) SafeWrite<int>(hClient + O::attack, 256);
-    }).detach();
+        delay += 35 + shots * 6;
+    nextDelayMs = delay;
 }
 
 static Vector3 CalcAngles(const Vector3& s, const Vector3& d) {
@@ -823,7 +1184,8 @@ static void NormAngles(Vector3& a) {
 
 
 void DoLegitAim(uintptr_t localPawn, int localTeam, int sw, int sh) {
-    if (!g_config.aimEnabled || !IsValid(localPawn) || !IsAlive(localPawn)) return;
+    if (!g_config.aimEnabled || !IsInGame()) return;
+    if (!IsValid(localPawn) || !IsAlive(localPawn)) return;
     if (!IsKeyDown(g_config.aimKey)) { g_hasTarget = false; return; }
     if (g_config.aimOnlyWhenScoped && !SafeRead<uint8_t>(localPawn + O::m_bIsScoped, 0)) return;
 
@@ -831,6 +1193,7 @@ void DoLegitAim(uintptr_t localPawn, int localTeam, int sw, int sh) {
     if (!IsValid(va)) return;
 
     Vector3 eye = GetOrigin(localPawn);
+    if (!OriginSane(eye)) return;
     Vector3 vo = GetViewOffset(localPawn);
     eye.x += vo.x; eye.y += vo.y; eye.z += vo.z;
 
@@ -866,7 +1229,7 @@ void DoLegitAim(uintptr_t localPawn, int localTeam, int sw, int sh) {
             bestFov = fov; best = ang; found = true;
             return; // first bone in priority that is inside FOV wins
         }
-    };
+        };
 
     if (g_cacheCount > 0) {
         for (int i = 0; i < g_cacheCount; i++) {
@@ -876,7 +1239,8 @@ void DoLegitAim(uintptr_t localPawn, int localTeam, int sw, int sh) {
             if (g_config.aimVisibleOnly && !IsSpotted(c.pawn)) continue;
             consider(c.pawn);
         }
-    } else {
+    }
+    else {
         for (int i = 1; i <= 64; i++) {
             uintptr_t ctrl = GetEntity(i);
             if (!ctrl) continue;
@@ -913,7 +1277,8 @@ void DoLegitAim(uintptr_t localPawn, int localTeam, int sw, int sh) {
         NormAngles(n);
         if (!std::isnan(n.x) && !std::isnan(n.y))
             *(Vector3*)va = n;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
 // -------------------- DRAW HELPERS --------------------
@@ -970,7 +1335,8 @@ void DrawSpectatorList(uintptr_t localPawn) {
             GetPlayerName(ctrl, names[count], 128);
             if (!names[count][0]) sprintf_s(names[count], "player %d", i);
             count++;
-        } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
     }
 
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
@@ -1080,7 +1446,7 @@ void DrawFovCircle(ImDrawList* dl) {
 void DrawCrosshair(ImDrawList* dl) {
     if (!g_config.customCrosshair) return;
     ImVec2 c(ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.5f);
-    ImU32 col = IM_COL32((int)(g_config.chR*255),(int)(g_config.chG*255),(int)(g_config.chB*255),230);
+    ImU32 col = IM_COL32((int)(g_config.chR * 255), (int)(g_config.chG * 255), (int)(g_config.chB * 255), 230);
     float s = g_config.chSize, g = g_config.chGap, t = g_config.chThick;
     dl->AddLine(ImVec2(c.x - s - g, c.y), ImVec2(c.x - g, c.y), col, t);
     dl->AddLine(ImVec2(c.x + g, c.y), ImVec2(c.x + s + g, c.y), col, t);
@@ -1199,46 +1565,54 @@ void ApplyGlow(uintptr_t pawn, bool enemy) {
         *(float*)(glow + O::Glow::m_fGlowColor) = g_config.glowR;
         *(float*)(glow + O::Glow::m_fGlowColor + 4) = g_config.glowG;
         *(float*)(glow + O::Glow::m_fGlowColor + 8) = g_config.glowB;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
     SafeWrite<uint8_t>(glow + O::Glow::m_bGlowing, 1);
     SafeWrite<uint8_t>(glow + O::Glow::m_bEligibleForScreenHighlight, 1);
 }
 
 void DoGlow(uintptr_t localPawn, int localTeam) {
-    if (!g_config.glowEnabled) return;
+    if (!g_config.glowEnabled || !IsInGame()) return;
     for (int i = 0; i < g_cacheCount; i++) {
         auto& c = g_cache[i];
-        if (!c.alive || c.pawn == localPawn) continue;
+        if (!c.alive || !IsValid(c.pawn) || c.pawn == localPawn) continue;
+        if (!IsAlive(c.pawn)) continue;
         if (g_config.espTeamCheck && c.team == localTeam) continue;
+        if (!OriginSane(GetOrigin(c.pawn))) continue;
         ApplyGlow(c.pawn, c.team != localTeam);
     }
 }
 
 // -------------------- SOUND / MOVEMENT ESP --------------------
 void DrawSoundEsp(ImDrawList* dl, uintptr_t localPawn, int localTeam, int sw, int sh) {
-    if (!g_config.soundEsp || !IsValid(localPawn)) return;
+    if (!g_config.soundEsp || !IsValid(localPawn) || !IsInGame()) return;
     Vector3 eye = GetOrigin(localPawn);
+    if (!OriginSane(eye)) return;
     eye.z += GetViewOffset(localPawn).z;
     Vector3 viewAng = SafeRead<Vector3>(hClient + O::dwViewAngles, {});
 
     for (int i = 0; i < g_cacheCount; i++) {
         auto& c = g_cache[i];
-        if (!c.alive || c.pawn == localPawn) continue;
+        if (!c.alive || !IsValid(c.pawn) || c.pawn == localPawn) continue;
+        if (!IsAlive(c.pawn)) continue;
         if (c.team == localTeam) continue;
         if (IsSpotted(c.pawn)) continue; // only non-visible
+
+        Vector3 pos = GetOrigin(c.pawn);
+        if (!OriginSane(pos)) continue;
 
         Vector3 vel{};
         __try {
             vel.x = *(float*)(c.pawn + O::m_vecVelocity);
             vel.y = *(float*)(c.pawn + O::m_vecVelocity + 4);
             vel.z = *(float*)(c.pawn + O::m_vecVelocity + 8);
-        } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
         float speed = sqrtf(vel.x * vel.x + vel.y * vel.y);
         if (speed < g_config.soundMinSpeed) continue;
 
-        Vector3 pos = GetOrigin(c.pawn);
         float dx = pos.x - eye.x, dy = pos.y - eye.y, dz = pos.z - eye.z;
-        float distM = sqrtf(dx*dx + dy*dy + dz*dz) * 0.01905f;
+        float distM = sqrtf(dx * dx + dy * dy + dz * dz) * 0.01905f;
         if (distM > g_config.soundMaxDist) continue;
 
         // Angle relative to view yaw
@@ -1266,113 +1640,349 @@ void DrawSoundEsp(ImDrawList* dl, uintptr_t localPawn, int localTeam, int sw, in
 // -------------------- SKIN / KNIFE CHANGER (fallback fields) --------------------
 
 
-// -------------------- MODERN GUI STYLE --------------------
+// -------------------- rak-hus-legit PREMIUM GUI STYLE --------------------
+// Crab-meat palette: deep crimson, coral, cream, dark blood-red undertones
+namespace RH {
+    // Core palette
+    static const ImVec4 BgDeep = ImVec4(0.06f, 0.035f, 0.04f, 0.92f);   // almost black with red (slightly transparent for shader)
+    static const ImVec4 BgSidebar = ImVec4(0.09f, 0.045f, 0.05f, 0.88f);
+    static const ImVec4 BgChild = ImVec4(0.08f, 0.04f, 0.045f, 0.55f);   // more transparent so shader effects show through
+    static const ImVec4 Accent = ImVec4(0.85f, 0.18f, 0.22f, 1.00f);   // crab red
+    static const ImVec4 AccentBright = ImVec4(1.00f, 0.35f, 0.32f, 1.00f);   // coral highlight
+    static const ImVec4 AccentSoft = ImVec4(0.70f, 0.22f, 0.25f, 0.55f);
+    static const ImVec4 Cream = ImVec4(0.96f, 0.90f, 0.86f, 1.00f);
+    static const ImVec4 TextMuted = ImVec4(0.62f, 0.50f, 0.48f, 1.00f);
+    static const ImVec4 Frame = ImVec4(0.16f, 0.09f, 0.10f, 1.00f);
+    static const ImVec4 FrameHover = ImVec4(0.24f, 0.12f, 0.13f, 1.00f);
+    static const ImVec4 Separator = ImVec4(0.45f, 0.18f, 0.20f, 0.45f);
+}
+
 void SetupImGuiStyle() {
     ImGuiStyle& s = ImGui::GetStyle();
-    s.WindowRounding = 10.f;
-    s.ChildRounding = 8.f;
-    s.FrameRounding = 6.f;
-    s.GrabRounding = 6.f;
-    s.PopupRounding = 8.f;
-    s.ScrollbarRounding = 8.f;
-    s.TabRounding = 6.f;
+
+    // Geometry – soft, premium feel
+    s.WindowRounding = 14.f;
+    s.ChildRounding = 10.f;
+    s.FrameRounding = 8.f;
+    s.GrabRounding = 8.f;
+    s.PopupRounding = 10.f;
+    s.ScrollbarRounding = 10.f;
+    s.TabRounding = 8.f;
     s.WindowPadding = ImVec2(0, 0);
-    s.FramePadding = ImVec2(10, 6);
-    s.ItemSpacing = ImVec2(10, 8);
-    s.ItemInnerSpacing = ImVec2(8, 4);
-    s.ScrollbarSize = 10.f;
-    s.GrabMinSize = 10.f;
+    s.FramePadding = ImVec2(12, 7);
+    s.ItemSpacing = ImVec2(12, 9);
+    s.ItemInnerSpacing = ImVec2(8, 5);
+    s.ScrollbarSize = 8.f;
+    s.GrabMinSize = 12.f;
     s.WindowBorderSize = 0.f;
     s.ChildBorderSize = 0.f;
     s.FrameBorderSize = 0.f;
+    s.PopupBorderSize = 0.f;
+    s.AntiAliasedLines = true;
+    s.AntiAliasedFill = true;
 
     ImVec4* c = s.Colors;
-    c[ImGuiCol_WindowBg]        = ImVec4(0.07f, 0.07f, 0.09f, 0.97f);
-    c[ImGuiCol_ChildBg]         = ImVec4(0.09f, 0.09f, 0.11f, 1.00f);
-    c[ImGuiCol_PopupBg]         = ImVec4(0.10f, 0.10f, 0.13f, 0.98f);
-    c[ImGuiCol_Border]          = ImVec4(0.20f, 0.22f, 0.30f, 0.40f);
-    c[ImGuiCol_FrameBg]         = ImVec4(0.12f, 0.13f, 0.17f, 1.00f);
-    c[ImGuiCol_FrameBgHovered]  = ImVec4(0.16f, 0.18f, 0.24f, 1.00f);
-    c[ImGuiCol_FrameBgActive]   = ImVec4(0.18f, 0.20f, 0.28f, 1.00f);
-    c[ImGuiCol_TitleBg]         = ImVec4(0.08f, 0.08f, 0.10f, 1.00f);
-    c[ImGuiCol_TitleBgActive]   = ImVec4(0.10f, 0.11f, 0.15f, 1.00f);
-    c[ImGuiCol_CheckMark]       = ImVec4(0.35f, 0.75f, 1.00f, 1.00f);
-    c[ImGuiCol_SliderGrab]      = ImVec4(0.30f, 0.65f, 0.95f, 0.90f);
-    c[ImGuiCol_SliderGrabActive]= ImVec4(0.40f, 0.75f, 1.00f, 1.00f);
-    c[ImGuiCol_Button]          = ImVec4(0.16f, 0.22f, 0.35f, 0.85f);
-    c[ImGuiCol_ButtonHovered]   = ImVec4(0.22f, 0.32f, 0.50f, 1.00f);
-    c[ImGuiCol_ButtonActive]    = ImVec4(0.14f, 0.20f, 0.35f, 1.00f);
-    c[ImGuiCol_Header]          = ImVec4(0.16f, 0.22f, 0.35f, 0.70f);
-    c[ImGuiCol_HeaderHovered]   = ImVec4(0.22f, 0.30f, 0.48f, 0.90f);
-    c[ImGuiCol_HeaderActive]    = ImVec4(0.18f, 0.28f, 0.45f, 1.00f);
-    c[ImGuiCol_Separator]       = ImVec4(0.20f, 0.22f, 0.28f, 0.60f);
-    c[ImGuiCol_Text]            = ImVec4(0.92f, 0.93f, 0.96f, 1.00f);
-    c[ImGuiCol_TextDisabled]    = ImVec4(0.45f, 0.48f, 0.55f, 1.00f);
+    c[ImGuiCol_WindowBg] = RH::BgDeep;
+    c[ImGuiCol_ChildBg] = RH::BgChild;
+    c[ImGuiCol_PopupBg] = ImVec4(0.11f, 0.06f, 0.07f, 0.98f);
+    c[ImGuiCol_Border] = ImVec4(0.55f, 0.20f, 0.22f, 0.25f);
+    c[ImGuiCol_BorderShadow] = ImVec4(0, 0, 0, 0);
+
+    c[ImGuiCol_FrameBg] = RH::Frame;
+    c[ImGuiCol_FrameBgHovered] = RH::FrameHover;
+    c[ImGuiCol_FrameBgActive] = ImVec4(0.30f, 0.14f, 0.15f, 1.00f);
+
+    c[ImGuiCol_TitleBg] = RH::BgDeep;
+    c[ImGuiCol_TitleBgActive] = RH::BgDeep;
+    c[ImGuiCol_TitleBgCollapsed] = RH::BgDeep;
+
+    c[ImGuiCol_CheckMark] = RH::AccentBright;
+    c[ImGuiCol_SliderGrab] = RH::Accent;
+    c[ImGuiCol_SliderGrabActive] = RH::AccentBright;
+
+    c[ImGuiCol_Button] = ImVec4(0.28f, 0.12f, 0.14f, 0.90f);
+    c[ImGuiCol_ButtonHovered] = ImVec4(0.42f, 0.16f, 0.18f, 1.00f);
+    c[ImGuiCol_ButtonActive] = ImVec4(0.55f, 0.18f, 0.20f, 1.00f);
+
+    c[ImGuiCol_Header] = ImVec4(0.32f, 0.13f, 0.15f, 0.75f);
+    c[ImGuiCol_HeaderHovered] = ImVec4(0.45f, 0.16f, 0.18f, 0.90f);
+    c[ImGuiCol_HeaderActive] = ImVec4(0.55f, 0.18f, 0.20f, 1.00f);
+
+    c[ImGuiCol_Separator] = RH::Separator;
+    c[ImGuiCol_SeparatorHovered] = RH::AccentSoft;
+    c[ImGuiCol_SeparatorActive] = RH::Accent;
+
+    c[ImGuiCol_Text] = RH::Cream;
+    c[ImGuiCol_TextDisabled] = RH::TextMuted;
+    c[ImGuiCol_TextSelectedBg] = ImVec4(0.70f, 0.20f, 0.22f, 0.35f);
+
+    c[ImGuiCol_ScrollbarBg] = ImVec4(0.08f, 0.04f, 0.045f, 0.80f);
+    c[ImGuiCol_ScrollbarGrab] = ImVec4(0.45f, 0.18f, 0.20f, 0.70f);
+    c[ImGuiCol_ScrollbarGrabHovered] = RH::Accent;
+    c[ImGuiCol_ScrollbarGrabActive] = RH::AccentBright;
+
+    c[ImGuiCol_PlotLines] = RH::Accent;
+    c[ImGuiCol_PlotHistogram] = RH::AccentBright;
 }
 
+// Smooth animated sidebar button with glowing active indicator
 static bool SidebarButton(const char* label, int id, int& current) {
     bool active = (current == id);
-    if (active) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.35f, 0.60f, 1.f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.40f, 0.65f, 1.f));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 1.f, 1.f, 1.f));
-    } else {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.f, 0.f, 0.f, 0.f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.14f, 0.16f, 0.22f, 1.f));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.68f, 0.75f, 1.f));
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    if (window->SkipItems) return false;
+
+    ImGuiContext& g = *GImGui;
+    const ImGuiStyle& style = g.Style;
+    const ImGuiID wid = window->GetID(label);
+    const ImVec2 label_size = ImGui::CalcTextSize(label, nullptr, true);
+
+    ImVec2 pos = window->DC.CursorPos;
+    ImVec2 size = ImVec2(ImGui::GetContentRegionAvail().x, 40.f);
+    const ImRect bb(pos, ImVec2(pos.x + size.x, pos.y + size.y));
+
+    ImGui::ItemSize(size, style.FramePadding.y);
+    if (!ImGui::ItemAdd(bb, wid)) return false;
+
+    bool hovered, held;
+    bool pressed = ImGui::ButtonBehavior(bb, wid, &hovered, &held);
+    if (pressed) current = id;
+
+    // Animated lerp for background
+    static float anim[8] = {};
+    float& t = anim[id < 8 ? id : 0];
+    float target = active ? 1.f : (hovered ? 0.45f : 0.f);
+    t = t + (target - t) * ImGui::GetIO().DeltaTime * 12.f;
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    // Soft background fill
+    if (t > 0.01f) {
+        ImU32 col = ImGui::GetColorU32(ImVec4(
+            0.55f * t, 0.12f * t, 0.14f * t, 0.55f + 0.25f * t));
+        dl->AddRectFilled(bb.Min, bb.Max, col, 8.f);
     }
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
-    bool clicked = ImGui::Button(label, ImVec2(-1, 36));
-    ImGui::PopStyleVar();
-    ImGui::PopStyleColor(3);
-    if (clicked) current = id;
-    return clicked;
+
+    // Left accent bar (animated width + glow)
+    if (t > 0.05f) {
+        float barW = 3.5f + 2.5f * t;
+        ImU32 barCol = ImGui::GetColorU32(ImVec4(1.f, 0.32f + 0.2f * t, 0.30f, 0.7f + 0.3f * t));
+        dl->AddRectFilled(ImVec2(bb.Min.x, bb.Min.y + 6), ImVec2(bb.Min.x + barW, bb.Max.y - 6), barCol, 3.f);
+
+        // Soft outer glow
+        dl->AddRectFilled(ImVec2(bb.Min.x, bb.Min.y + 4), ImVec2(bb.Min.x + barW + 4.f, bb.Max.y - 4),
+            ImGui::GetColorU32(ImVec4(0.9f, 0.2f, 0.22f, 0.15f * t)), 4.f);
+    }
+
+    // Text
+    ImVec4 txtCol = active ? RH::Cream : (hovered ? ImVec4(0.90f, 0.78f, 0.75f, 1.f) : RH::TextMuted);
+    ImVec2 text_pos = ImVec2(bb.Min.x + 18.f, bb.Min.y + (size.y - label_size.y) * 0.5f);
+    dl->AddText(text_pos, ImGui::GetColorU32(txtCol), label);
+
+    return pressed;
 }
 
 static void SectionHeader(const char* title) {
     ImGui::Spacing();
-    ImGui::TextColored(ImVec4(0.40f, 0.70f, 1.00f, 1.f), "%s", title);
-    ImGui::Separator();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+
+    // Accent diamond / marker
+    float pulse = 0.65f + 0.35f * sinf((float)ImGui::GetTime() * 3.2f);
+    dl->AddCircleFilled(ImVec2(p.x + 5, p.y + 8), 3.5f,
+        ImGui::GetColorU32(ImVec4(0.95f, 0.28f, 0.30f, pulse)));
+
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 16);
+    ImGui::TextColored(RH::AccentBright, "%s", title);
+
+    // Thin animated underline
+    ImVec2 p2 = ImGui::GetCursorScreenPos();
+    float w = ImGui::GetContentRegionAvail().x;
+    float t = (float)ImGui::GetTime();
+    dl->AddRectFilled(ImVec2(p2.x, p2.y), ImVec2(p2.x + w * 0.55f, p2.y + 1.5f),
+        ImGui::GetColorU32(ImVec4(0.75f, 0.20f, 0.22f, 0.55f + 0.2f * sinf(t * 2.1f))), 1.f);
+    ImGui::Spacing();
     ImGui::Spacing();
 }
 
 void DrawMenu() {
     static float alpha = 0.f;
-    if (g_config.showMenu) alpha = (std::min)(1.f, alpha + 0.08f);
-    else alpha = (std::max)(0.f, alpha - 0.08f);
-    if (alpha < 0.01f) {
-        ImGui::SetNextWindowPos(ImVec2(14, 14), ImGuiCond_Always);
-        ImGui::Begin("##hint", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+    const float dt = ImGui::GetIO().DeltaTime;
+    if (g_config.showMenu) alpha = (std::min)(1.f, alpha + dt * 7.5f);
+    else                   alpha = (std::max)(0.f, alpha - dt * 8.5f);
+
+    if (alpha < 0.015f) {
+        ImGui::SetNextWindowPos(ImVec2(18, 18), ImGuiCond_Always);
+        ImGui::Begin("##hint", nullptr,
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_AlwaysAutoResize);
-        ImGui::TextColored(ImVec4(0.45f, 0.55f, 0.75f, 0.55f), "INSERT  ·  rakhus legit");
+        float pulse = 0.45f + 0.25f * sinf((float)ImGui::GetTime() * 2.8f);
+        ImGui::TextColored(ImVec4(0.90f, 0.35f, 0.35f, pulse), "INSERT  ·  rak-hus-legit");
         ImGui::End();
         return;
     }
 
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
-    ImGui::SetNextWindowSize(ImVec2(620, 460), ImGuiCond_Always);
-    ImGui::Begin("##rakhus", &g_config.showMenu,
-        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoTitleBar);
+    ImGui::SetNextWindowSize(ImVec2(700, 540), ImGuiCond_Always);
+    ImGui::Begin("##rak-hus-legit", &g_config.showMenu,
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoScrollbar);
 
-    // Sidebar
-    ImGui::BeginChild("##side", ImVec2(150, 0), false);
-    ImGui::SetCursorPos(ImVec2(12, 16));
-    ImGui::TextColored(ImVec4(0.35f, 0.75f, 1.f, 1.f), "RAKHUS");
-    ImGui::SetCursorPosX(12);
-    ImGui::TextColored(ImVec4(0.45f, 0.48f, 0.55f, 1.f), "legit  ·  14178");
-    ImGui::Spacing(); ImGui::Spacing();
-    ImGui::SetCursorPosX(8);
-    ImGui::BeginGroup();
-    SidebarButton("  Aimbot", 0, g_menuTab);
-    SidebarButton("  Trigger", 1, g_menuTab);
-    SidebarButton("  Visuals", 2, g_menuTab);
-    SidebarButton("  Misc", 3, g_menuTab);
-    SidebarButton("  Glow", 4, g_menuTab);
-    SidebarButton("  Config", 5, g_menuTab);
-    ImGui::EndGroup();
-    ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 40);
-    ImGui::SetCursorPosX(12);
-    ImGui::TextColored(ImVec4(0.35f, 0.38f, 0.45f, 1.f), "INSERT close");
+    ImDrawList* wdl = ImGui::GetWindowDrawList();
+    ImVec2 wp = ImGui::GetWindowPos();
+    ImVec2 ws = ImGui::GetWindowSize();
+    float t = (float)ImGui::GetTime();
+
+    // ============================================================
+    //  SHADER-STYLE PROCEDURAL BACKGROUND (ImDrawList based)
+    //  Animated glow orbs, scanlines, vignette, light rays, waves
+    // ============================================================
+
+    // 1) Deep base fill
+    wdl->AddRectFilled(wp, ImVec2(wp.x + ws.x, wp.y + ws.y),
+        ImGui::GetColorU32(ImVec4(0.055f, 0.028f, 0.032f, 0.97f)), 14.f);
+
+    // 2) Soft animated glow orbs (fake volumetric light)
+    auto drawGlowOrb = [&](float cx, float cy, float radius, float intensity, float r, float g, float b) {
+        const int layers = 6;
+        for (int i = layers; i >= 1; --i) {
+            float f = (float)i / layers;
+            float rad = radius * (0.35f + 0.65f * f);
+            float a = intensity * (1.f - f) * (1.f - f) * 0.55f;
+            wdl->AddCircleFilled(ImVec2(wp.x + cx, wp.y + cy), rad,
+                ImGui::GetColorU32(ImVec4(r, g, b, a)), 32);
+        }
+        };
+
+    float orb1x = ws.x * 0.25f + sinf(t * 0.45f) * 40.f;
+    float orb1y = ws.y * 0.30f + cosf(t * 0.38f) * 30.f;
+    drawGlowOrb(orb1x, orb1y, 160.f, 0.55f + 0.15f * sinf(t * 1.2f), 0.85f, 0.12f, 0.16f);
+
+    float orb2x = ws.x * 0.78f + cosf(t * 0.32f) * 50.f;
+    float orb2y = ws.y * 0.70f + sinf(t * 0.41f) * 35.f;
+    drawGlowOrb(orb2x, orb2y, 190.f, 0.40f + 0.12f * cosf(t * 0.9f), 0.70f, 0.15f, 0.22f);
+
+    float orb3x = ws.x * 0.55f + sinf(t * 0.28f + 1.5f) * 60.f;
+    float orb3y = ws.y * 0.15f + cosf(t * 0.55f) * 25.f;
+    drawGlowOrb(orb3x, orb3y, 110.f, 0.35f, 1.00f, 0.28f, 0.25f);
+
+    // 3) Diagonal light streaks
+    for (int i = 0; i < 4; ++i) {
+        float phase = t * (0.15f + i * 0.04f) + i * 1.7f;
+        float x0 = fmodf(phase * 80.f, ws.x + 200.f) - 100.f;
+        float y0 = -40.f + i * 30.f;
+        float x1 = x0 + 220.f;
+        float y1 = y0 + ws.y + 80.f;
+        ImU32 col = ImGui::GetColorU32(ImVec4(0.95f, 0.22f, 0.25f, 0.035f + 0.015f * sinf(t * 2.f + i)));
+        wdl->AddLine(ImVec2(wp.x + x0, wp.y + y0), ImVec2(wp.x + x1, wp.y + y1), col, 18.f + i * 4.f);
+    }
+
+    // 4) Horizontal scanlines
+    for (float y = 0.f; y < ws.y; y += 3.5f) {
+        float a = 0.018f + 0.012f * sinf(y * 0.08f + t * 3.5f);
+        wdl->AddLine(ImVec2(wp.x, wp.y + y), ImVec2(wp.x + ws.x, wp.y + y),
+            ImGui::GetColorU32(ImVec4(1.f, 0.3f, 0.3f, a)), 1.0f);
+    }
+
+    // 5) Bottom wave
+    {
+        const int segs = 48;
+        ImVec2 pts[49];
+        for (int i = 0; i <= segs; ++i) {
+            float x = (float)i / segs * ws.x;
+            float y = ws.y - 28.f + sinf(x * 0.025f + t * 1.8f) * 7.f
+                + sinf(x * 0.05f - t * 2.3f) * 4.f;
+            pts[i] = ImVec2(wp.x + x, wp.y + y);
+        }
+        for (int i = 0; i < segs; ++i) {
+            wdl->AddLine(pts[i], pts[i + 1],
+                ImGui::GetColorU32(ImVec4(0.90f, 0.25f, 0.28f, 0.22f)), 1.8f);
+        }
+    }
+
+    // 6) Vignette
+    {
+        float vig = 0.55f;
+        wdl->AddRectFilledMultiColor(wp, ImVec2(wp.x + ws.x, wp.y + 70.f),
+            ImGui::GetColorU32(ImVec4(0, 0, 0, vig)), ImGui::GetColorU32(ImVec4(0, 0, 0, vig)),
+            ImGui::GetColorU32(ImVec4(0, 0, 0, 0)), ImGui::GetColorU32(ImVec4(0, 0, 0, 0)));
+        wdl->AddRectFilledMultiColor(ImVec2(wp.x, wp.y + ws.y - 80.f), ImVec2(wp.x + ws.x, wp.y + ws.y),
+            ImGui::GetColorU32(ImVec4(0, 0, 0, 0)), ImGui::GetColorU32(ImVec4(0, 0, 0, 0)),
+            ImGui::GetColorU32(ImVec4(0, 0, 0, vig)), ImGui::GetColorU32(ImVec4(0, 0, 0, vig)));
+        wdl->AddRectFilledMultiColor(wp, ImVec2(wp.x + 60.f, wp.y + ws.y),
+            ImGui::GetColorU32(ImVec4(0, 0, 0, vig * 0.7f)), ImGui::GetColorU32(ImVec4(0, 0, 0, 0)),
+            ImGui::GetColorU32(ImVec4(0, 0, 0, 0)), ImGui::GetColorU32(ImVec4(0, 0, 0, vig * 0.7f)));
+        wdl->AddRectFilledMultiColor(ImVec2(wp.x + ws.x - 60.f, wp.y), ImVec2(wp.x + ws.x, wp.y + ws.y),
+            ImGui::GetColorU32(ImVec4(0, 0, 0, 0)), ImGui::GetColorU32(ImVec4(0, 0, 0, vig * 0.7f)),
+            ImGui::GetColorU32(ImVec4(0, 0, 0, vig * 0.7f)), ImGui::GetColorU32(ImVec4(0, 0, 0, 0)));
+    }
+
+    // 7) Breathing outer glow border
+    float glowA = 0.22f + 0.10f * sinf(t * 1.6f);
+    wdl->AddRect(ImVec2(wp.x - 1.5f, wp.y - 1.5f), ImVec2(wp.x + ws.x + 1.5f, wp.y + ws.y + 1.5f),
+        ImGui::GetColorU32(ImVec4(0.90f, 0.22f, 0.24f, glowA)), 15.f, 0, 2.2f);
+    wdl->AddRect(ImVec2(wp.x - 4.f, wp.y - 4.f), ImVec2(wp.x + ws.x + 4.f, wp.y + ws.y + 4.f),
+        ImGui::GetColorU32(ImVec4(0.80f, 0.15f, 0.18f, glowA * 0.35f)), 17.f, 0, 1.0f);
+
+    // 8) Top accent highlight
+    wdl->AddRectFilledMultiColor(
+        ImVec2(wp.x + 14, wp.y + 1), ImVec2(wp.x + ws.x - 14, wp.y + 3.5f),
+        ImGui::GetColorU32(ImVec4(0.9f, 0.15f, 0.18f, 0.0f)),
+        ImGui::GetColorU32(ImVec4(1.0f, 0.40f, 0.32f, 0.90f)),
+        ImGui::GetColorU32(ImVec4(1.0f, 0.40f, 0.32f, 0.90f)),
+        ImGui::GetColorU32(ImVec4(0.9f, 0.15f, 0.18f, 0.0f)));
+
+    // ===== SIDEBAR =====
+    ImGui::BeginChild("##side", ImVec2(168, 0), false);
+    {
+        ImDrawList* sdl = ImGui::GetWindowDrawList();
+        ImVec2 sp = ImGui::GetWindowPos();
+        ImVec2 ss = ImGui::GetWindowSize();
+
+        // Sidebar background (semi-transparent so shader orbs bleed through)
+        sdl->AddRectFilledMultiColor(sp, ImVec2(sp.x + ss.x, sp.y + ss.y),
+            ImGui::GetColorU32(ImVec4(0.10f, 0.045f, 0.05f, 0.82f)),
+            ImGui::GetColorU32(ImVec4(0.07f, 0.035f, 0.04f, 0.88f)),
+            ImGui::GetColorU32(ImVec4(0.07f, 0.035f, 0.04f, 0.88f)),
+            ImGui::GetColorU32(ImVec4(0.10f, 0.045f, 0.05f, 0.82f)));
+
+        // Vertical accent
+        sdl->AddRectFilled(ImVec2(sp.x + ss.x - 2, sp.y + 20), ImVec2(sp.x + ss.x, sp.y + ss.y - 20),
+            ImGui::GetColorU32(ImVec4(0.75f, 0.18f, 0.20f, 0.35f)));
+
+        // Logo / Title
+        ImGui::SetCursorPos(ImVec2(16, 22));
+        ImGui::PushFont(ImGui::GetIO().Fonts->Fonts[0]);
+        float logoPulse = 0.75f + 0.25f * sinf(t * 2.4f);
+        ImGui::TextColored(ImVec4(1.f, 0.32f + 0.1f * logoPulse, 0.30f, 1.f), "rak-hus");
+        ImGui::PopFont();
+        ImGui::SetCursorPosX(16);
+        ImGui::TextColored(RH::TextMuted, "legit  ·  cs2");
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 6);
+
+        // Decorative line under logo
+        ImVec2 lp = ImGui::GetCursorScreenPos();
+        sdl->AddRectFilled(ImVec2(lp.x + 4, lp.y), ImVec2(lp.x + 110, lp.y + 1.5f),
+            ImGui::GetColorU32(ImVec4(0.70f, 0.18f, 0.20f, 0.5f)));
+
+        ImGui::Spacing(); ImGui::Spacing(); ImGui::Spacing();
+
+        ImGui::SetCursorPosX(6);
+        ImGui::BeginGroup();
+        SidebarButton("  Aimbot", 0, g_menuTab);
+        SidebarButton("  Trigger", 1, g_menuTab);
+        SidebarButton("  Visuals", 2, g_menuTab);
+        SidebarButton("  Misc", 3, g_menuTab);
+        SidebarButton("  Glow", 4, g_menuTab);
+        SidebarButton("  Config", 5, g_menuTab);
+        ImGui::EndGroup();
+
+        // Bottom status
+        ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 48);
+        ImGui::SetCursorPosX(14);
+        ImGui::TextColored(ImVec4(0.50f, 0.35f, 0.35f, 0.8f), "INSERT  close");
+        ImGui::SetCursorPosX(14);
+        ImGui::TextColored(ImVec4(0.40f, 0.28f, 0.28f, 0.6f), "v1.4  premium");
+    }
     ImGui::EndChild();
 
     ImGui::SameLine();
@@ -1399,12 +2009,13 @@ void DrawMenu() {
         ImGui::Text("Aim key:");
         ImGui::SameLine();
         if (bindAim) {
-            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f), "press key...");
+            ImGui::TextColored(ImVec4(1.f, 0.45f, 0.35f, 1.f), "press key...");
             for (int vk = 1; vk < 256; vk++) {
                 if (vk == VK_INSERT) continue;
                 if (GetAsyncKeyState(vk) & 0x8000) { g_config.aimKey = vk; bindAim = false; SaveConfig(); break; }
             }
-        } else {
+        }
+        else {
             char kb[24]; sprintf_s(kb, "0x%02X", g_config.aimKey);
             if (ImGui::Button(kb, ImVec2(70, 0))) bindAim = true;
             ImGui::SameLine();
@@ -1421,30 +2032,39 @@ void DrawMenu() {
     else if (g_menuTab == 1) {
         SectionHeader("TRIGGERBOT");
         ImGui::Checkbox("Enable", &g_config.triggerEnabled);
-        ImGui::SliderInt("Delay min (ms)", &g_config.triggerDelayMin, 30, 250);
-        ImGui::SliderInt("Delay max (ms)", &g_config.triggerDelayMax, 50, 350);
-        ImGui::TextDisabled("Higher = more pause between shots (recoil).");
+        const char* tbones[] = { "Head", "Neck", "Chest" };
+        ImGui::Combo("Bone (only fire on)", &g_config.triggerBone, tbones, 3);
+        ImGui::SliderFloat("Bone FOV (px)", &g_config.triggerBoneFov, 3.f, 40.f, "%.0f");
+        ImGui::TextDisabled("Only shoots when that bone is under the crosshair.");
+
+        ImGui::SliderInt("Delay min (ms)", &g_config.triggerDelayMin, 20, 250);
+        ImGui::SliderInt("Delay max (ms)", &g_config.triggerDelayMax, 30, 350);
         if (g_config.triggerDelayMax < g_config.triggerDelayMin)
             g_config.triggerDelayMax = g_config.triggerDelayMin;
         ImGui::Checkbox("Team check", &g_config.triggerTeamCheck);
         ImGui::Checkbox("Visible only", &g_config.triggerVisibleOnly);
 
+        SectionHeader("TRIGGER RCS");
+        ImGui::Checkbox("Anti-recoil (hit through spray)", &g_config.triggerRcs);
+        ImGui::SliderFloat("RCS strength", &g_config.triggerRcsStrength, 0.1f, 1.f, "%.2f");
+        ImGui::TextDisabled("Compensates aim punch so the bullet still hits the bone.");
+
         static bool bindTrig = false;
         ImGui::Text("Trigger key:");
         ImGui::SameLine();
         if (bindTrig) {
-            ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f), "press key...");
+            ImGui::TextColored(ImVec4(1.f, 0.45f, 0.35f, 1.f), "press key...");
             for (int vk = 1; vk < 256; vk++) {
                 if (vk == VK_INSERT) continue;
                 if (GetAsyncKeyState(vk) & 0x8000) { g_config.triggerKey = vk; bindTrig = false; SaveConfig(); break; }
             }
-        } else {
+        }
+        else {
             char kb[24]; sprintf_s(kb, "0x%02X", g_config.triggerKey);
             if (ImGui::Button(kb, ImVec2(70, 0))) bindTrig = true;
             ImGui::SameLine();
             if (ImGui::Button("M5")) { g_config.triggerKey = VK_XBUTTON2; SaveConfig(); }
         }
-        ImGui::TextDisabled("Random delay between min–max for more natural timing.");
     }
     else if (g_menuTab == 2) {
         SectionHeader("ESP");
@@ -1483,12 +2103,13 @@ void DrawMenu() {
             ImGui::Text("Hold key:");
             ImGui::SameLine();
             if (bindTp) {
-                ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f), "press...");
+                ImGui::TextColored(ImVec4(1.f, 0.45f, 0.35f, 1.f), "press...");
                 for (int vk = 1; vk < 256; vk++) {
                     if (vk == VK_INSERT) continue;
                     if (GetAsyncKeyState(vk) & 0x8000) { g_config.thirdPersonKey = vk; bindTp = false; SaveConfig(); break; }
                 }
-            } else {
+            }
+            else {
                 char kb[24]; sprintf_s(kb, "0x%02X", g_config.thirdPersonKey);
                 if (ImGui::Button(kb, ImVec2(70, 0))) bindTp = true;
                 ImGui::SameLine();
@@ -1535,7 +2156,7 @@ void DrawMenu() {
         ImGui::Spacing();
         ImGui::TextDisabled("%s", GetConfigPath().c_str());
         ImGui::Spacing();
-        ImGui::TextColored(ImVec4(0.5f, 0.7f, 0.5f, 1.f), "Legit preset tips:");
+        ImGui::TextColored(ImVec4(0.95f, 0.40f, 0.38f, 1.f), "Legit preset tips:");
         ImGui::BulletText("Smooth 0.70–0.85 · FOV 20–35");
         ImGui::BulletText("Humanize ~0.3 · RCS strength ~0.5");
         ImGui::BulletText("Trigger delay 25–60 ms random");
@@ -1556,134 +2177,147 @@ void DrawFrame() {
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
-    // Pattern-resolved globals first, static offsets as fallback
+    // Pattern-resolved globals first (from pattern_scan.h), offsets as fallback
     if (Pat::g_res.gameEntitySystemPtr)
         g_pES = Pat::ReadPtr(Pat::g_res.gameEntitySystemPtr);
     else
         g_pES = SafeRead<uintptr_t>(hClient + O::dwGameEntitySystem, 0);
 
-    // Prefer dumper RVA for view matrix (more reliable than pattern LEA for W2S)
-    SafeMemcpy(viewMatrix, (void*)(hClient + O::dwViewMatrix), sizeof(viewMatrix));
-    // If matrix looks zeroed, try pattern-resolved address
-    if (viewMatrix[0] == 0.f && viewMatrix[5] == 0.f && viewMatrix[10] == 0.f && Pat::g_res.viewMatrix)
+    // View matrix: prefer dumper RVA, fall back to pattern
+    if (Pat::g_res.viewMatrix)
         SafeMemcpy(viewMatrix, (void*)Pat::g_res.viewMatrix, sizeof(viewMatrix));
+    else
+        SafeMemcpy(viewMatrix, (void*)(hClient + O::dwViewMatrix), sizeof(viewMatrix));
+    if (viewMatrix[0] == 0.f && viewMatrix[5] == 0.f && viewMatrix[10] == 0.f)
+        SafeMemcpy(viewMatrix, (void*)(hClient + O::dwViewMatrix), sizeof(viewMatrix));
 
-        int sw = (int)ImGui::GetIO().DisplaySize.x;
-        int sh = (int)ImGui::GetIO().DisplaySize.y;
-        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    int sw = (int)ImGui::GetIO().DisplaySize.x;
+    int sh = (int)ImGui::GetIO().DisplaySize.y;
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
 
-        RefreshEntityCache();
+    RefreshEntityCache();
 
-        uintptr_t pLocal = SafeRead<uintptr_t>(hClient + O::dwLocalPlayerPawn, 0);
-        if (IsValid(pLocal) && IsAlive(pLocal)) {
-            int localTeam = Team(pLocal);
-            DoNoFlash(pLocal);
-            DoNoSmoke(pLocal);
-            DoThirdPerson(pLocal);
-            DoSoftRCS(pLocal);
-            DoNoVisualRecoil(pLocal);
-            DoTriggerbot(pLocal, localTeam);
-            UpdateHitmarker(pLocal, localTeam);
-            DoGlow(pLocal, localTeam);
+    // Not in a match → only menu, no feature memory access (prevents leave-crash)
+    uintptr_t pLocal = 0;
+    if (IsInGame())
+        pLocal = SafeRead<uintptr_t>(hClient + O::dwLocalPlayerPawn, 0);
 
-            if (g_config.espEnabled) {
-                for (int i = 1; i <= 64; i++) {
-                    uintptr_t ctrl = GetEntity(i);
-                    if (!ctrl) continue;
-                    uintptr_t pawn = HandleToEnt(SafeRead<uint32_t>(ctrl + O::m_hPlayerPawn, 0));
-                    if (!IsValid(pawn) || pawn == pLocal || !IsAlive(pawn)) continue;
-                    if (g_config.espTeamCheck && Team(pawn) == localTeam) continue;
-                    bool vis = IsSpotted(pawn);
-                    if (g_config.espVisibleOnly && !vis) continue;
+    if (IsValid(pLocal) && IsAlive(pLocal) && IsInGame()) {
+        int localTeam = Team(pLocal);
+        DoNoFlash(pLocal);
+        DoNoSmoke(pLocal);
+        DoThirdPerson(pLocal);
+        DoSoftRCS(pLocal);
+        DoNoVisualRecoil(pLocal);
+        DoTriggerbot(pLocal, localTeam);
+        UpdateHitmarker(pLocal, localTeam);
+        DoGlow(pLocal, localTeam);
 
-                    Vector3 feet = GetOrigin(pawn);
-                    feet.z += 4.f; // visual sole lift — abs origin sits slightly under model
-                    Vector3 head;
-                    GetBonePos(pawn, O::Bone::head, head);
-                    // head already includes crouch-aware height; small extra so box clears helmet
-                    head.z += 2.f;
+        if (g_config.espEnabled) {
+            for (int i = 1; i <= 64; i++) {
+                uintptr_t ctrl = GetEntity(i);
+                if (!IsValid(ctrl)) continue;
+                if (!ControllerPawnAlive(ctrl)) continue; // disconnect / leave filter
 
-                    Vector3 eye = GetOrigin(pLocal);
-                    eye.z += GetViewOffset(pLocal).z;
-                    float distM = sqrtf((head.x-eye.x)*(head.x-eye.x)+(head.y-eye.y)*(head.y-eye.y)+(head.z-eye.z)*(head.z-eye.z)) * 0.01905f;
-                    if (distM > g_config.espMaxDistance) continue;
+                uintptr_t pawn = HandleToEnt(SafeRead<uint32_t>(ctrl + O::m_hPlayerPawn, 0));
+                if (!IsValid(pawn) || pawn == pLocal || !IsAlive(pawn)) continue;
 
-                    Vector2 sf, shs;
-                    if (!WorldToScreen(feet, sf, sw, sh) || !WorldToScreen(head, shs, sw, sh)) continue;
-                    float h = sf.y - shs.y;
-                    if (h < 6.f) continue;
-                    float w = h * 0.42f;
-                    float x = shs.x - w * 0.5f, y = shs.y;
+                Vector3 feet = GetOrigin(pawn);
+                if (!OriginSane(feet)) continue; // ghost at 0,0,0 after leave
 
-                    ImU32 col = vis
-                        ? IM_COL32((int)(g_config.espVisColorR*255),(int)(g_config.espVisColorG*255),(int)(g_config.espVisColorB*255),210)
-                        : IM_COL32((int)(g_config.espColorR*255),(int)(g_config.espColorG*255),(int)(g_config.espColorB*255),200);
+                if (g_config.espTeamCheck && Team(pawn) == localTeam) continue;
+                bool vis = IsSpotted(pawn);
+                if (g_config.espVisibleOnly && !vis) continue;
 
-                    if (g_config.espBox) {
-                        if (g_config.espBoxOutline)
-                            dl->AddRect(ImVec2(x-1, y-1), ImVec2(x+w+1, y+h+1), IM_COL32(0,0,0,140), 0.f, 0, 1.f);
-                        dl->AddRect(ImVec2(x, y), ImVec2(x+w, y+h), col, 0.f, 0, g_config.espBoxThickness);
-                    }
-                    if (g_config.espHeadDot) {
-                        Vector2 hd;
-                        Vector3 hp; GetBonePos(pawn, O::Bone::head, hp);
-                        if (WorldToScreen(hp, hd, sw, sh))
-                            dl->AddCircleFilled(ImVec2(hd.x, hd.y), 2.2f, col);
-                    }
-                    if (g_config.espHealth) {
-                        int hp = (std::clamp)(HP(pawn), 0, 100);
-                        float bh = h * (hp / 100.f);
-                        ImU32 hc = hp > 60 ? IM_COL32(50,210,90,255) : hp > 30 ? IM_COL32(230,190,40,255) : IM_COL32(230,55,55,255);
-                        dl->AddRectFilled(ImVec2(x - 5, y + h - bh), ImVec2(x - 2, y + h), hc);
-                        dl->AddRect(ImVec2(x - 5, y), ImVec2(x - 2, y + h), IM_COL32(0,0,0,160));
-                    }
-                    if (g_config.espArmor && Armor(pawn) > 0) {
-                        float bh = h * ((std::clamp)(Armor(pawn), 0, 100) / 100.f);
-                        dl->AddRectFilled(ImVec2(x + w + 2, y + h - bh), ImVec2(x + w + 5, y + h), IM_COL32(70,140,255,230));
-                    }
-                    float ty = y - 13.f;
-                    if (g_config.espName) {
-                        char name[128]; GetPlayerName(ctrl, name, sizeof(name));
-                        if (name[0]) {
-                            ImVec2 ts = ImGui::CalcTextSize(name);
-                            dl->AddText(ImVec2(shs.x - ts.x * 0.5f, ty), IM_COL32(240,240,245,235), name);
-                            ty -= 13.f;
-                        }
-                    }
-                    if (g_config.espWeapon) {
-                        char wn[64]; GetWeaponName(pawn, wn, sizeof(wn));
-                        if (wn[0]) {
-                            ImVec2 ts = ImGui::CalcTextSize(wn);
-                            dl->AddText(ImVec2(shs.x - ts.x * 0.5f, y + h + 2), IM_COL32(190,190,200,210), wn);
-                        }
-                    }
-                    if (g_config.espDistance) {
-                        char dt[16]; sprintf_s(dt, "%.0fm", distM);
-                        dl->AddText(ImVec2(x, y + h + (g_config.espWeapon ? 15.f : 2.f)), IM_COL32(170,170,180,190), dt);
-                    }
-                    if (g_config.espSkeleton) DrawSkeleton(dl, pawn, sw, sh, col);
+                feet.z += 4.f; // visual sole lift — abs origin sits slightly under model
+                Vector3 head;
+                if (!GetBonePos(pawn, O::Bone::head, head)) continue;
+                // head already includes crouch-aware height; small extra so box clears helmet
+                head.z += 2.f;
+                if (!OriginSane(head)) continue;
+
+                Vector3 eye = GetOrigin(pLocal);
+                eye.z += GetViewOffset(pLocal).z;
+                float distM = sqrtf((head.x - eye.x) * (head.x - eye.x) + (head.y - eye.y) * (head.y - eye.y) + (head.z - eye.z) * (head.z - eye.z)) * 0.01905f;
+                if (distM > g_config.espMaxDistance) continue;
+
+                Vector2 sf, shs;
+                if (!WorldToScreen(feet, sf, sw, sh) || !WorldToScreen(head, shs, sw, sh)) continue;
+                float h = sf.y - shs.y;
+                if (h < 6.f) continue;
+                float w = h * 0.42f;
+                float x = shs.x - w * 0.5f, y = shs.y;
+
+                ImU32 col = vis
+                    ? IM_COL32((int)(g_config.espVisColorR * 255), (int)(g_config.espVisColorG * 255), (int)(g_config.espVisColorB * 255), 210)
+                    : IM_COL32((int)(g_config.espColorR * 255), (int)(g_config.espColorG * 255), (int)(g_config.espColorB * 255), 200);
+
+                if (g_config.espBox) {
+                    if (g_config.espBoxOutline)
+                        dl->AddRect(ImVec2(x - 1, y - 1), ImVec2(x + w + 1, y + h + 1), IM_COL32(0, 0, 0, 140), 0.f, 0, 1.f);
+                    dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h), col, 0.f, 0, g_config.espBoxThickness);
                 }
+                if (g_config.espHeadDot) {
+                    Vector2 hd;
+                    Vector3 hp; GetBonePos(pawn, O::Bone::head, hp);
+                    if (WorldToScreen(hp, hd, sw, sh))
+                        dl->AddCircleFilled(ImVec2(hd.x, hd.y), 2.2f, col);
+                }
+                if (g_config.espHealth) {
+                    int hp = (std::clamp)(HP(pawn), 0, 100);
+                    float bh = h * (hp / 100.f);
+                    ImU32 hc = hp > 60 ? IM_COL32(50, 210, 90, 255) : hp > 30 ? IM_COL32(230, 190, 40, 255) : IM_COL32(230, 55, 55, 255);
+                    dl->AddRectFilled(ImVec2(x - 5, y + h - bh), ImVec2(x - 2, y + h), hc);
+                    dl->AddRect(ImVec2(x - 5, y), ImVec2(x - 2, y + h), IM_COL32(0, 0, 0, 160));
+                }
+                if (g_config.espArmor && Armor(pawn) > 0) {
+                    float bh = h * ((std::clamp)(Armor(pawn), 0, 100) / 100.f);
+                    dl->AddRectFilled(ImVec2(x + w + 2, y + h - bh), ImVec2(x + w + 5, y + h), IM_COL32(70, 140, 255, 230));
+                }
+                float ty = y - 13.f;
+                if (g_config.espName) {
+                    char name[128]; GetPlayerName(ctrl, name, sizeof(name));
+                    if (name[0]) {
+                        ImVec2 ts = ImGui::CalcTextSize(name);
+                        dl->AddText(ImVec2(shs.x - ts.x * 0.5f, ty), IM_COL32(240, 240, 245, 235), name);
+                        ty -= 13.f;
+                    }
+                }
+                if (g_config.espWeapon) {
+                    char wn[64]; GetWeaponName(pawn, wn, sizeof(wn));
+                    if (wn[0]) {
+                        ImVec2 ts = ImGui::CalcTextSize(wn);
+                        dl->AddText(ImVec2(shs.x - ts.x * 0.5f, y + h + 2), IM_COL32(190, 190, 200, 210), wn);
+                    }
+                }
+                if (g_config.espDistance) {
+                    char dt[16]; sprintf_s(dt, "%.0fm", distM);
+                    dl->AddText(ImVec2(x, y + h + (g_config.espWeapon ? 15.f : 2.f)), IM_COL32(170, 170, 180, 190), dt);
+                }
+                if (g_config.espSkeleton) DrawSkeleton(dl, pawn, sw, sh, col);
             }
-
-            DrawSpectatorList(pLocal);
-            DrawHitmarker(dl);
-            DrawFovCircle(dl);
-            DrawCrosshair(dl);
-            DrawBombTimer(dl);
-            DrawSoundEsp(dl, pLocal, localTeam, sw, sh);
-            DoLegitAim(pLocal, localTeam, sw, sh);
-        } else if (IsValid(pLocal)) {
-            DrawSpectatorList(pLocal);
         }
 
-        DrawMenu();
+        DrawSpectatorList(pLocal);
+        DrawHitmarker(dl);
+        DrawFovCircle(dl);
+        DrawCrosshair(dl);
+        DrawBombTimer(dl);
+        DrawSoundEsp(dl, pLocal, localTeam, sw, sh);
+        DoLegitAim(pLocal, localTeam, sw, sh);
+    }
+    else if (IsValid(pLocal)) {
+        DrawSpectatorList(pLocal);
+    }
 
-        ImGui::EndFrame();
-        ImGui::Render();
-        if (g_mainRenderTargetView && g_pd3dDeviceContext) {
-            g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
-            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        }
+    DrawMenu();
+
+    ImGui::EndFrame();
+    ImGui::Render();
+    if (g_mainRenderTargetView && g_pd3dDeviceContext) {
+        g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    }
 }
 
 // -------------------- HOOKS --------------------
@@ -1703,13 +2337,31 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
                 ImGui::CreateContext();
                 ImGuiIO& io = ImGui::GetIO();
                 io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+                io.IniFilename = nullptr; // no imgui.ini spam
+
+                // Premium fonts – try modern Windows fonts first
+                ImFontConfig cfg;
+                cfg.OversampleH = 3;
+                cfg.OversampleV = 2;
+                cfg.PixelSnapH = true;
+                cfg.RasterizerMultiply = 1.1f;
+
+                // Primary UI font (Segoe UI Semibold looks clean & modern)
+                if (!io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\seguisb.ttf", 16.0f, &cfg)) {
+                    if (!io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 16.0f, &cfg)) {
+                        io.Fonts->AddFontDefault(); // fallback
+                    }
+                }
+                // Slightly larger for titles / headers if needed later
+                io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\seguisb.ttf", 18.5f, &cfg);
+
                 SetupImGuiStyle();
                 ImGui_ImplWin32_Init(g_gameHwnd);
                 if (ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext)) {
                     g_imGuiInitialized = true;
                     g_OriginalWndProc = (WNDPROC)SetWindowLongPtr(g_gameHwnd, GWLP_WNDPROC, (LONG_PTR)HookedWndProc);
                     LoadConfig();
-                    LOG("[+] legit UI ready");
+                    LOG("[+] rak-hus-legit premium UI ready");
                 }
             }
         }
@@ -1719,7 +2371,8 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
             if (bb) { g_pd3dDevice->CreateRenderTargetView(bb, nullptr, &g_mainRenderTargetView); bb->Release(); }
         }
         if (g_imGuiInitialized && g_mainRenderTargetView) DrawFrame();
-    } catch (...) {}
+    }
+    catch (...) {}
     return oPresent(pSwapChain, SyncInterval, Flags);
 }
 
@@ -1754,7 +2407,8 @@ DWORD WINAPI MainLoop(LPVOID) {
         LOG_FMT("    ApplyEconCustom   @ 0x%llX\n", (unsigned long long)Pat::g_res.applyEconCustomization);
         LOG_FMT("    ThirdPersonReset  @ 0x%llX\n", (unsigned long long)Pat::g_res.thirdPersonReset);
         LOG_FMT("    CSGOInput         @ 0x%llX\n", (unsigned long long)Pat::g_res.csgoInputPtr);
-    } else {
+    }
+    else {
         LOG("[-] pattern resolve incomplete — using static offsets");
     }
 
@@ -1767,11 +2421,13 @@ DWORD WINAPI MainLoop(LPVOID) {
                     LOG("[+] DrawSmokeArray hooked (NoSmoke)");
                 else
                     LOG("[-] DrawSmokeArray enable failed");
-            } else {
+            }
+            else {
                 LOG("[-] DrawSmokeArray create hook failed");
             }
         }
-    } else {
+    }
+    else {
         LOG("[-] DrawSmokeArray pattern not found — NoSmoke uses memory fallback");
     }
 
@@ -1798,7 +2454,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         g_hModule = hModule;
         DisableThreadLibraryCalls(hModule);
         InitConsole();
-        LOG("[+] rakhus legit loaded");
+        LOG("[+] rak-hus-legit loaded");
         CreateThread(NULL, 0, MainLoop, NULL, 0, NULL);
     }
     return TRUE;
