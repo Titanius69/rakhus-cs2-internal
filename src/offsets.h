@@ -13,7 +13,7 @@ namespace O {
     constexpr std::ptrdiff_t dwEntityList = 0x2571220;
     constexpr std::ptrdiff_t dwGameEntitySystem_highestEntityIndex = 0x2090;
     constexpr std::ptrdiff_t dwGlobalVars = 0x20AF5F0;
-    constexpr std::ptrdiff_t dwPlantedC4 = 0x2390A18;
+    constexpr std::ptrdiff_t dwPlantedC4 = 0x2390A14; // pPlantedC4s from sdk 14178
     constexpr std::ptrdiff_t dwSensitivity = 0x23C3578;
     constexpr std::ptrdiff_t dwSensitivity_sensitivity = 0x58;
     constexpr std::ptrdiff_t dwGlowManager = 0x23C2A58;

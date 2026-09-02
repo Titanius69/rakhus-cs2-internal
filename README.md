@@ -1,28 +1,8 @@
 # rakhus-cs2-internal
 
-Internal **legit** cheat for [Counter-Strike 2](https://store.steampowered.com/app/730).  
-Schema / offsets target: **build 14178** (cs2-sdk dump).
+Internal **legit** cheat for Counter-Strike 2 (schema target: **build 14178**).
 
-Focus: smooth aim, soft RCS, natural triggerbot, ESP, bomb timer, modern ImGui menu.  
-**No rage features** (no spinbot, no silent aim, no shoot-through-walls).  
-**No skin / knife changer** (removed — was unreliable clientside).
-
-> **Educational / private use only.** Online matchmaking can result in VAC, Overwatch, or account bans. You are solely responsible for how you use this software.
-
-**[Watch the showcase video](https://youtu.be/-6PLDWjY0e4)**
-
----
-
-## Quick start
-
-1. Build the project (see [Build](#build)).
-2. Start CS2 and reach the main menu (or a match).
-3. Inject `rakhus.dll` into `cs2.exe` (LoadLibrary or manual-map injector).
-4. A console window titled **`rakhus-legit`** should open (pattern resolve log).
-5. Press **INSERT** to open / close the menu.
-6. Enable the features you want; settings save to **`legit.ini`**.
-
-**First inject tip:** delete any old `legit.ini` so new defaults load cleanly.
+> Educational and private use only. Online play risks VAC, Overwatch, and account bans.
 
 ---
 
@@ -31,188 +11,95 @@ Focus: smooth aim, soft RCS, natural triggerbot, ESP, bomb timer, modern ImGui m
 | Key | Action |
 |-----|--------|
 | **INSERT** | Toggle menu |
-| Aim key (default **LMB**) | Hold to aim assist |
-| Trigger key (default **Mouse 5**) | Hold to triggerbot |
-| Third-person key (default **Mouse 4**) | **Hold** for third person (release = first person) |
-
-All feature keys are rebindable in the menu (click the hex key button, then press a key).
+| **END** | Unload the cheat (waits for Present to finish, then restores hooks) |
+| Aim / Trigger / third-person keys | Hold keys; rebindable in the menu |
 
 ---
 
 ## Features
 
 ### Aimbot
-| Option | Description |
-|--------|-------------|
-| Enable | Smooth aim assist toward selected bone |
-| FOV | Pixel FOV radius |
-| Smooth | Higher = slower / more legit |
-| Humanize | Small random offset on the aim point |
-| Bone | Head / Neck / Chest |
-| Bone priority | Head → Neck → Chest (first bone inside FOV wins) |
-| Team check | Enemies only |
-| Visible only | Spotted targets only |
-| Only when scoped | Aim only while zoomed |
-| Draw FOV circle | On-screen FOV overlay |
-| Aim key | Hold key (default LMB) |
+- Smooth FOV aim, bone priority, humanize, visible and team filters
+- **Recoil-aware aim** — aim punch is applied to the target angles
+- **Unified punch** — soft RCS yields while aiming (single punch authority)
+- **Early punch path** — no-visual-recoil and RCS run before ESP (CreateMove-style ordering on Present)
 
 ### Soft RCS
-- Partial aim-punch compensation (strength 0–1)
-- Configurable start bullet
-- **Auto-disabled while No Visual Recoil is on** (avoids camera glitches)
+- Partial recoil compensation; automatically disabled when No Visual Recoil is on
 
 ### Triggerbot
-- Crosshair entity via `m_iIDEntIndex`
-- Inter-shot delay (min/max ms) for recoil settle
-- Extra pause while spraying
-- Team check; visible-only optional (default off)
-- Rebindable hold key
+- Threadless state machine
+- **Weapon delay profiles** (AWP slower, pistols faster)
+- **Flash and smoke checks** (smoke uses a cheap proximity flag from a periodic scan)
+- Optional trigger RCS and bone FOV
 
-### ESP
-- Box + outline, name, health, armor
-- Weapon name, distance (m)
-- Head dot, optional skeleton
-- Visible vs hidden colors
-- Max distance, team / visible filters
+### ESP (optimized)
+- Boxes, health, armor, distance, skeleton, head dot
+- **Name and weapon text cache** on `CachedPlayer` (refreshed about every 20 ticks)
+- Entity cache path (no second pass over slots 1–64 every frame)
+- **ESP Y bias**, skeleton every other frame, off-screen culling
 
-Positions use `m_vecAbsOrigin` + crouch-aware view offset. Bones only when near the body.
-
-### Glow
-- `CGlowProperty` on enemies
-- RGBA + type **0–3** (0 = outline … 3 = strongest)
-
-### Sound ESP
-- Edge arrows for non-visible moving enemies + distance (velocity-based)
-
-### Bomb timer
-- Centered `BOMB A · 12.3s` after plant
-- `m_flC4Blow` − curtime, or local countdown fallback
+### Visual extras
+- **Glow** (types 0–3)
+- **Sound ESP** arrows
+- **Bomb timer** (HUD) and **bomb world ESP** (C4 on the map)
+- **Grenade prediction** line (approximate ballistics, no collision)
+- **Sniper crosshair** when AWP or scout is unscoped
+- **Hitmarker** and **hitlog** (floating damage numbers)
+- **Watermark** — FPS and pattern OK count
+- **FOV changer** via an **OverrideView** hook (when the pattern resolves)
 
 ### Misc
-| Feature | Description |
-|---------|-------------|
-| No Flash | Clears flash overlay |
-| No Smoke | `smokegrenade_projectile` filter + optional DrawSmokeArray hook |
-| No Visual Recoil | Zeros aim-punch services only (no viewangle writes) |
-| Spectator list | Observer pawn / mode / target |
-| Hitmarker | Enemy HP drop + fade |
-| Custom crosshair | Size / gap / thickness / color |
-| Third person | **Hold key** (off by default). Safe CSGOInput + optional reset patch |
+- No Flash / No Smoke (`DrawSmokeArray` hook preferred)
+- No Visual Recoil
+- Spectator list
+- **Third person** (hold key): engine path via CSGOInput flag and ThirdPersonReset patch (not CViewSetup origin)
+- Config: **pattern health**, **reset this tab** buttons, save/load `legit.ini`
 
 ---
 
-## Menu tabs
+## Architecture notes
 
-| Tab | Contents |
-|-----|----------|
-| Aimbot | Aim + soft RCS |
-| Trigger | Triggerbot |
-| Visuals | ESP |
-| Misc | Flash / smoke / NVR / spectators / hitmarker / bomb / third person / sound / crosshair |
-| Glow | Enemy glow |
-| Config | Save / load |
-
-Config file: **`legit.ini`**.
+| Item | Implementation |
+|------|----------------|
+| ESP cache | `CachedPlayer` plus lazy text cache |
+| Entity listener style | Lite cache with stale text; full VMT listener still optional |
+| OverrideView | MinHook on the SDK pattern — **FOV only** (values already in the 60–120 range) |
+| Third person | Separate engine path: CSGOInput + ThirdPersonReset (not OverrideView origin) |
+| CreateMove | Not a separate hook; **early punch path** approximates ordering |
+| Unload | END → wait for `g_presentBusy` → disable OverrideView and smoke hooks → kiero → free the DLL |
 
 ---
 
 ## Build
-
-**Requirements:** Windows x64, VS 2022 (MSVC), CMake ≥ 3.20
 
 ```bat
 cmake --preset x64-debug
 cmake --build --preset x64-debug
 ```
 
-Output: `rakhus.dll`.
+Inject `rakhus.dll` into `cs2.exe`. Delete any old `legit.ini` after major updates so new defaults load.
 
 ---
 
-## Injection
+## Performance (casual, about 10 players)
 
-1. Run CS2  
-2. Inject `rakhus.dll` into `cs2.exe`  
-3. Check console `rakhus-legit` for pattern logs  
-4. **INSERT** → menu  
-
-If the game crashes: leave **Third person** and **No Smoke** off, re-enable one by one.
+- Keep the text cache and skeleton every-other-frame options enabled
+- Lower ESP max distance if needed
+- Disable grenade prediction or glow if the frame rate drops
 
 ---
 
-## Pattern scan
+## Limitations
 
-| Pattern | Use |
-|---------|-----|
-| `pViewMatrix` | View matrix (static RVA preferred for W2S) |
-| `pGameEntitySystem` | Entity system |
-| `pLocalPlayerController` | Local controller |
-| `UpdateGlobalVars` | Global vars / bomb timer |
-| `pGlowManager` | Glow |
-| `pCSGOInput` | Input + third person |
-| `DrawSmokeArray` | Optional NoSmoke hook |
-| `ThirdPersonReset` | Optional third-person patch |
-
-Fallbacks: static RVAs in `src/offsets.h`.
-
----
-
-## Project layout
-
-```
-rakhus/
-├── CMakeLists.txt
-├── CMakePresets.json
-├── LICENSE
-├── README.md
-└── src/
-    ├── dllmain.cpp
-    ├── offsets.h
-    ├── pattern_scan.h
-    ├── imgui/
-    └── kiero/
-```
-
----
-
-## After a game update
-
-Refresh at least:
-
-- `dwGameEntitySystem`, `dwLocalPlayerPawn`, `dwViewMatrix`, `dwViewAngles`
-- `dwGlobalVars`, `dwPlantedC4`, `dwGlowManager`
-- Pawn fields: health, team, scene node, weapon services, glow, flash/smoke, aim punch, `m_iIDEntIndex`
-
-If class layouts stay the same and only globals move, updating `dw*` is often enough.
-
----
-
-## Known limitations
-
-1. **No Visual Recoil** — punch zeroed on Present path; tiny residual possible without CreateMove. Do not combine with Soft RCS.  
-2. **Third person** — hold-key path only; full distance needs OverrideView (not included).  
-3. **Sound ESP** — velocity-based, not real footsteps.  
-4. **Bomb timer** — curtime can drift; local countdown is fallback.  
-5. **Skeleton** — bone layout varies; falls back to origin + view offset.  
-6. **NoSmoke** — entity writes + optional draw hook; map-dependent.
-
----
-
-## Troubleshooting
-
-| Problem | Try |
-|---------|-----|
-| No menu | Inject after main menu; INSERT; check console |
-| ESP low / shifted | Delete `legit.ini`; rebuild; check ViewMatrix log |
-| Trigger never fires | Visible only **off**; check key; raise delay |
-| NVR glitches | Soft RCS **off**; only NVR |
-| Crash on third person | Leave TP **off** |
-| Crash on smoke | Disable No Smoke |
+- FOV depends on OverrideView and on FOV slots that already look valid (60–120)
+- **Third person does not use OverrideView origin**
+- Grenade trajectory is approximate (no world collision)
+- Smoke check is proximity-based, not a full engine volume query
+- Full `IEntityListener` VMT is not hooked yet (cache-lite only)
 
 ---
 
 ## License
 
-See [LICENSE](LICENSE).
-
-Provided as-is, without warranty. Use at your own risk.
+See [LICENSE](LICENSE). Provided as-is, without warranty.

@@ -36,6 +36,7 @@ static float g_TriggerFovPx = 18.f;
 #include "imgui/imgui_impl_dx11.h"
 #include "offsets.h"
 #include "pattern_scan.h"
+#include "core/runtime.h"
 #include "kiero/kiero.h"
 #include "kiero/minhook/include/MinHook.h"
 
@@ -62,6 +63,12 @@ using SmokeDrawFn = void* (__fastcall*)(void*, void*, void*, void*, void*, void*
 static SmokeDrawFn oSmokeDrawArray = nullptr;
 
 HMODULE g_hModule = nullptr;
+volatile bool g_running = true;
+volatile bool g_unloadRequested = false;
+volatile bool g_featuresEnabled = true;  // END toggles this; DLL always stays loaded
+volatile long g_presentBusy = 0; // Present re-entrancy for safe unload
+static bool g_smokeNearby = false;
+static int  g_smokeScanTick = 0;
 HWND g_gameHwnd = nullptr;
 
 ID3D11Device* g_pd3dDevice = nullptr;
@@ -84,25 +91,28 @@ static float g_rcsPunchX = 0.f, g_rcsPunchY = 0.f;
 static int g_localCtrlIndex = -1; // local controller entity-list slot (1..64)
 
 // -------------------- LEGIT CONFIG --------------------
-#define AIM_KEY_DEFAULT VK_LBUTTON
+#define AIM_KEY_DEFAULT VK_XBUTTON2  // Mouse5 hold — not LMB
 #define TRIGGER_KEY_DEFAULT VK_XBUTTON2
 
 struct Config {
     // Aimbot (legit)
     bool aimEnabled = true;
-    float aimFov = 28.0f;
-    float aimSmooth = 0.78f;       // higher = slower / more human
+    float aimFov = 50.0f;
+    float aimSmooth = 0.72f;
     int aimBone = 0;               // 0 head 1 neck 2 chest
     int aimKey = AIM_KEY_DEFAULT;
     bool aimTeamCheck = true;
-    bool aimVisibleOnly = true;
+    bool aimVisibleOnly = false;  // spotted-only often blocks all targets
     bool aimOnlyWhenScoped = false;
-    float aimHumanize = 0.35f;     // micro randomness 0-1
+    float aimHumanize = 0.0f;      // randomness causes jitter — off
     bool aimDrawFov = true;
+    bool aimRecoilComp = false;    // off by default — was fighting mouse / soft RCS
+    float aimRecoilCompStr = 1.0f; // 0-1 how much punch to bake into aim angles
+
 
     // Soft RCS
-    bool rcsEnabled = true;
-    float rcsStrength = 0.55f;     // 0-1 partial compensation
+    bool rcsEnabled = false;  // angle write disabled in code
+    float rcsStrength = 0.35f;     // keep mild if enabled
     int rcsStartBullet = 2;        // start after N shots
 
     // Triggerbot
@@ -113,9 +123,13 @@ struct Config {
     bool triggerTeamCheck = true;
     bool triggerVisibleOnly = false;
     int  triggerBone = 0;            // 0 head, 1 neck, 2 chest — only fire on this bone
-    bool triggerRcs = true;          // anti-recoil while trigger fires
+    bool triggerRcs = false;         // off by default — was fighting aimbot
     float triggerRcsStrength = 1.0f; // 0–1 full punch compensation
     float triggerBoneFov = 12.f;     // max pixels: bone must be this close to crosshair
+    bool triggerWeaponProfiles = true; // AWP slower / pistol faster delays
+    bool triggerFlashCheck = true;     // don't fire while flashed
+    bool triggerSmokeCheck = true;     // don't fire while in smoke cloud
+    float triggerFlashMax = 0.35f;     // max m_flFlashDuration to still allow fire
 
     // ESP (subtle)
     bool espEnabled = true;
@@ -133,12 +147,15 @@ struct Config {
     float espColorR = 0.95f, espColorG = 0.35f, espColorB = 0.35f;
     float espVisColorR = 0.25f, espVisColorG = 0.85f, espVisColorB = 0.45f;
     float espBoxThickness = 1.4f;
-    float espMaxDistance = 80.f;   // meters
+    float espMaxDistance = 80.f;
+    float espYBias = 0.f;          // screen-space vertical bias (px); + = down
+    bool  espSkeletonEveryOther = true; // cheaper skeleton
+    bool  espOptimize = true;   // meters
 
     // Misc legit
     bool noFlash = true;
     bool noSmoke = false;          // often considered less legit
-    bool noVisualRecoil = false;
+    bool noVisualRecoil = false; // only while spraying if enabled
     bool spectatorList = true;
     bool hitmarker = true;
     bool bombTimer = true;
@@ -165,6 +182,40 @@ struct Config {
     int  thirdPersonKey = 0x05;  // VK_XBUTTON1 default (Mouse 4)
     float thirdPersonDist = 120.f;
 
+    // Watermark / UI
+    bool watermark = true;
+
+    // FOV changer (OverrideView when hooked)
+    bool fovChanger = false; // permanently unused
+    float fovValue = 100.f;
+
+    // Sniper crosshair when unscoped
+    bool sniperCrosshair = true;
+
+    // Bomb world ESP
+    bool bombEsp = true;
+
+    // Grenade trajectory preview
+    bool nadePred = true;
+    int nadePredSteps = 40;
+
+    // Hitlog floating numbers
+    bool hitlog = true;
+
+    // Punch authority: soft RCS yields while aiming with recoil-comp
+    bool punchUnified = true;
+
+    // CreateMove-style early punch path (Present early stage)
+    bool earlyPunchPath = false;
+
+    // Entity cache listener-style (stale names ok, less full work)
+    bool entityCacheLite = true;
+
+    // Environment visual grade (client overlay — safe, no engine sky writes)
+    bool envEnabled = false;
+    int  envPreset = 0;       // 0 off handled by envEnabled; 1 Night 2 Warm 3 Cold 4 Dark 5 Bright
+    float envStrength = 0.45f;
+
     bool showMenu = false;
 } g_config;
 
@@ -186,6 +237,10 @@ struct CachedPlayer {
     int hp = 0;
     bool alive = false;
     int index = 0;
+    // text cache (refresh every N ticks — ESP perf)
+    char name[64]{};
+    char weapon[32]{};
+    int  textTick = 0;
 };
 static CachedPlayer g_cache[64];
 static int g_cacheCount = 0;
@@ -215,6 +270,8 @@ void SaveConfig() {
     w("aimOnlyWhenScoped", g_config.aimOnlyWhenScoped ? 1 : 0);
     w("aimHumanize", g_config.aimHumanize);
     w("aimDrawFov", g_config.aimDrawFov ? 1 : 0);
+    w("aimRecoilComp", g_config.aimRecoilComp ? 1 : 0);
+    w("aimRecoilCompStr", g_config.aimRecoilCompStr);
     w("rcsEnabled", g_config.rcsEnabled ? 1 : 0);
     w("rcsStrength", g_config.rcsStrength);
     w("rcsStartBullet", g_config.rcsStartBullet);
@@ -228,6 +285,10 @@ void SaveConfig() {
     w("triggerRcs", g_config.triggerRcs ? 1 : 0);
     w("triggerRcsStrength", g_config.triggerRcsStrength);
     w("triggerBoneFov", g_config.triggerBoneFov);
+    w("triggerWeaponProfiles", g_config.triggerWeaponProfiles ? 1 : 0);
+    w("triggerFlashCheck", g_config.triggerFlashCheck ? 1 : 0);
+    w("triggerSmokeCheck", g_config.triggerSmokeCheck ? 1 : 0);
+    w("triggerFlashMax", g_config.triggerFlashMax);
     w("espEnabled", g_config.espEnabled ? 1 : 0);
     w("espBox", g_config.espBox ? 1 : 0);
     w("espBoxOutline", g_config.espBoxOutline ? 1 : 0);
@@ -244,6 +305,9 @@ void SaveConfig() {
     w("espVisColorR", g_config.espVisColorR); w("espVisColorG", g_config.espVisColorG); w("espVisColorB", g_config.espVisColorB);
     w("espBoxThickness", g_config.espBoxThickness);
     w("espMaxDistance", g_config.espMaxDistance);
+    w("espYBias", g_config.espYBias);
+    w("espSkeletonEveryOther", g_config.espSkeletonEveryOther ? 1 : 0);
+    w("espOptimize", g_config.espOptimize ? 1 : 0);
     w("noFlash", g_config.noFlash ? 1 : 0);
     w("noSmoke", g_config.noSmoke ? 1 : 0);
     w("noVisualRecoil", g_config.noVisualRecoil ? 1 : 0);
@@ -253,6 +317,20 @@ void SaveConfig() {
     w("thirdPerson", g_config.thirdPerson ? 1 : 0);
     w("thirdPersonKey", g_config.thirdPersonKey);
     w("thirdPersonDist", g_config.thirdPersonDist);
+    w("entityCacheLite", g_config.entityCacheLite ? 1 : 0);
+    w("envEnabled", g_config.envEnabled ? 1 : 0);
+    w("envPreset", g_config.envPreset);
+    w("envStrength", g_config.envStrength);
+    w("earlyPunchPath", g_config.earlyPunchPath ? 1 : 0);
+    w("punchUnified", g_config.punchUnified ? 1 : 0);
+    w("hitlog", g_config.hitlog ? 1 : 0);
+    w("nadePred", g_config.nadePred ? 1 : 0);
+    w("nadePredSteps", g_config.nadePredSteps);
+    w("bombEsp", g_config.bombEsp ? 1 : 0);
+    w("sniperCrosshair", g_config.sniperCrosshair ? 1 : 0);
+    w("fovValue", g_config.fovValue);
+    w("fovChanger", g_config.fovChanger ? 1 : 0);
+    w("watermark", g_config.watermark ? 1 : 0);
     w("customCrosshair", g_config.customCrosshair ? 1 : 0);
     w("chSize", g_config.chSize); w("chGap", g_config.chGap); w("chThick", g_config.chThick);
     w("chR", g_config.chR); w("chG", g_config.chG); w("chB", g_config.chB);
@@ -285,6 +363,8 @@ void LoadConfig() {
             else if (k == "aimOnlyWhenScoped") g_config.aimOnlyWhenScoped = std::stoi(v) != 0;
             else if (k == "aimHumanize") g_config.aimHumanize = std::stof(v);
             else if (k == "aimDrawFov") g_config.aimDrawFov = std::stoi(v) != 0;
+            else if (k == "aimRecoilComp") g_config.aimRecoilComp = std::stoi(v) != 0;
+            else if (k == "aimRecoilCompStr") g_config.aimRecoilCompStr = std::stof(v);
             else if (k == "rcsEnabled") g_config.rcsEnabled = std::stoi(v) != 0;
             else if (k == "rcsStrength") g_config.rcsStrength = std::stof(v);
             else if (k == "rcsStartBullet") g_config.rcsStartBullet = std::stoi(v);
@@ -298,6 +378,10 @@ void LoadConfig() {
             else if (k == "triggerRcs") g_config.triggerRcs = std::stoi(v) != 0;
             else if (k == "triggerRcsStrength") g_config.triggerRcsStrength = std::stof(v);
             else if (k == "triggerBoneFov") g_config.triggerBoneFov = std::stof(v);
+            else if (k == "triggerWeaponProfiles") g_config.triggerWeaponProfiles = std::stoi(v) != 0;
+            else if (k == "triggerFlashCheck") g_config.triggerFlashCheck = std::stoi(v) != 0;
+            else if (k == "triggerSmokeCheck") g_config.triggerSmokeCheck = std::stoi(v) != 0;
+            else if (k == "triggerFlashMax") g_config.triggerFlashMax = std::stof(v);
             else if (k == "espEnabled") g_config.espEnabled = std::stoi(v) != 0;
             else if (k == "espBox") g_config.espBox = std::stoi(v) != 0;
             else if (k == "espBoxOutline") g_config.espBoxOutline = std::stoi(v) != 0;
@@ -318,6 +402,9 @@ void LoadConfig() {
             else if (k == "espVisColorB") g_config.espVisColorB = std::stof(v);
             else if (k == "espBoxThickness") g_config.espBoxThickness = std::stof(v);
             else if (k == "espMaxDistance") g_config.espMaxDistance = std::stof(v);
+            else if (k == "espYBias") g_config.espYBias = std::stof(v);
+            else if (k == "espSkeletonEveryOther") g_config.espSkeletonEveryOther = std::stoi(v) != 0;
+            else if (k == "espOptimize") g_config.espOptimize = std::stoi(v) != 0;
             else if (k == "noFlash") g_config.noFlash = std::stoi(v) != 0;
             else if (k == "noSmoke") g_config.noSmoke = std::stoi(v) != 0;
             else if (k == "noVisualRecoil") g_config.noVisualRecoil = std::stoi(v) != 0;
@@ -327,6 +414,20 @@ void LoadConfig() {
             else if (k == "thirdPerson") g_config.thirdPerson = std::stoi(v) != 0;
             else if (k == "thirdPersonKey") g_config.thirdPersonKey = std::stoi(v);
             else if (k == "thirdPersonDist") g_config.thirdPersonDist = std::stof(v);
+            else if (k == "entityCacheLite") g_config.entityCacheLite = std::stoi(v) != 0;
+            else if (k == "envEnabled") g_config.envEnabled = std::stoi(v) != 0;
+            else if (k == "envPreset") g_config.envPreset = std::stoi(v);
+            else if (k == "envStrength") g_config.envStrength = std::stof(v);
+            else if (k == "earlyPunchPath") g_config.earlyPunchPath = std::stoi(v) != 0;
+            else if (k == "punchUnified") g_config.punchUnified = std::stoi(v) != 0;
+            else if (k == "hitlog") g_config.hitlog = std::stoi(v) != 0;
+            else if (k == "nadePred") g_config.nadePred = std::stoi(v) != 0;
+            else if (k == "nadePredSteps") g_config.nadePredSteps = std::stoi(v);
+            else if (k == "bombEsp") g_config.bombEsp = std::stoi(v) != 0;
+            else if (k == "sniperCrosshair") g_config.sniperCrosshair = std::stoi(v) != 0;
+            else if (k == "fovValue") g_config.fovValue = std::stof(v);
+            else if (k == "fovChanger") g_config.fovChanger = std::stoi(v) != 0;
+            else if (k == "watermark") g_config.watermark = std::stoi(v) != 0;
             else if (k == "customCrosshair") g_config.customCrosshair = std::stoi(v) != 0;
             else if (k == "chSize") g_config.chSize = std::stof(v);
             else if (k == "chGap") g_config.chGap = std::stof(v);
@@ -460,6 +561,18 @@ static bool IsInGame() {
     return IsValid(lp);
 }
 
+static void GetPlayerName(uintptr_t ctrl, char* buf, size_t len);
+static void GetWeaponName(uintptr_t pawn, char* buf, size_t len);
+
+static void UpdatePlayerTextCache(CachedPlayer& c) {
+    if (!c.alive) { c.name[0] = 0; c.weapon[0] = 0; return; }
+    if (c.textTick + 20 >= g_cacheTick && c.name[0]) return; // still fresh
+    c.name[0] = 0; c.weapon[0] = 0;
+    if (IsValid(c.ctrl)) GetPlayerName(c.ctrl, c.name, sizeof(c.name));
+    if (IsValid(c.pawn)) GetWeaponName(c.pawn, c.weapon, sizeof(c.weapon));
+    c.textTick = g_cacheTick;
+}
+
 void RefreshEntityCache() {
     g_cacheTick++;
 
@@ -470,11 +583,9 @@ void RefreshEntityCache() {
         return;
     }
 
-    // Every-frame refresh (visibility index must not lag)
     uintptr_t localCtrl = SafeRead<uintptr_t>(hClient + O::dwLocalPlayerController, 0);
     uintptr_t localPawn = SafeRead<uintptr_t>(hClient + O::dwLocalPlayerPawn, 0);
 
-    // Prefer handle-based slot (matches SpottedByMask bit indexing)
     g_localCtrlIndex = ResolveLocalControllerIndex(localPawn);
     if (g_localCtrlIndex < 1 && IsValid(localCtrl)) {
         for (int i = 1; i <= 64; i++) {
@@ -482,6 +593,7 @@ void RefreshEntityCache() {
         }
     }
 
+    // Optimized: only 1..64 controllers (not full entity list)
     int n = 0;
     for (int i = 1; i <= 64 && n < 64; i++) {
         uintptr_t ctrl = GetEntity(i);
@@ -489,7 +601,6 @@ void RefreshEntityCache() {
         if (localCtrl && ctrl == localCtrl && g_localCtrlIndex < 1)
             g_localCtrlIndex = i;
 
-        // Drop disconnected controllers (ghost ESP source)
         if (ctrl != localCtrl && !ControllerPawnAlive(ctrl))
             continue;
 
@@ -506,6 +617,7 @@ void RefreshEntityCache() {
         c.alive = IsValid(pawn) && IsAlive(pawn);
         c.team = IsValid(pawn) ? Team(pawn) : 0;
         c.hp = IsValid(pawn) ? HP(pawn) : 0;
+        // text fields filled lazily by UpdatePlayerTextCache()
     }
     g_cacheCount = n;
 }
@@ -620,19 +732,19 @@ static int AimBoneIndex() {
 }
 
 static float viewMatrix[16];
-bool WorldToScreen(const Vector3& world, Vector2& screen, int sw, int sh) {
+bool WorldToScreen(const Vector3& world, Vector2& screen, int sw, int sh, bool applyEspBias = false) {
     __try {
-        // Row-major view-projection (cs2-dumper dwViewMatrix)
-        float cx = viewMatrix[0] * world.x + viewMatrix[1] * world.y + viewMatrix[2] * world.z + viewMatrix[3];
-        float cy = viewMatrix[4] * world.x + viewMatrix[5] * world.y + viewMatrix[6] * world.z + viewMatrix[7];
-        float cw = viewMatrix[12] * world.x + viewMatrix[13] * world.y + viewMatrix[14] * world.z + viewMatrix[15];
+        float cx = viewMatrix[0]*world.x + viewMatrix[1]*world.y + viewMatrix[2]*world.z + viewMatrix[3];
+        float cy = viewMatrix[4]*world.x + viewMatrix[5]*world.y + viewMatrix[6]*world.z + viewMatrix[7];
+        float cw = viewMatrix[12]*world.x + viewMatrix[13]*world.y + viewMatrix[14]*world.z + viewMatrix[15];
         if (cw < 0.001f) return false;
         float inv = 1.f / cw;
         screen.x = (sw * 0.5f) + (cx * inv) * (sw * 0.5f);
         screen.y = (sh * 0.5f) - (cy * inv) * (sh * 0.5f);
+        if (applyEspBias)
+            screen.y += g_config.espYBias;
         return true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 static void GetPlayerName(uintptr_t ctrl, char* buf, size_t len) {
@@ -757,6 +869,63 @@ static uintptr_t GetActiveWeapon(uintptr_t pawn) {
     if (!IsValid(ws)) return 0;
     return HandleToEnt(SafeRead<uint32_t>(ws + O::WeaponServices::m_hActiveWeapon, 0));
 }
+
+static int WeaponDelayProfileMs(uintptr_t localPawn, int baseDelay) {
+    if (!g_config.triggerWeaponProfiles || !IsValid(localPawn)) return baseDelay;
+    uintptr_t wep = GetActiveWeapon(localPawn);
+    if (!IsValid(wep)) return baseDelay;
+    uint16_t def = SafeRead<uint16_t>(wep + O::m_AttributeManager + O::m_Item + O::m_iItemDefinitionIndex, 0);
+    // AWP, SSG08, SCAR20, G3SG1
+    if (def == 9 || def == 40 || def == 38 || def == 11)
+        return (std::max)(baseDelay + 250, 320);
+    // Common rifles / SMGs
+    if (def == 7 || def == 16 || def == 60 || def == 8 || def == 10 || def == 13 || def == 17 || def == 33 || def == 34)
+        return baseDelay + 15;
+    // Pistols
+    if (def == 1 || def == 64 || def == 4 || def == 32 || def == 61 || def == 36 || def == 30 || def == 63 || def == 3 || def == 2)
+        return (std::max)(baseDelay - 25, 25);
+    // Shotguns
+    if (def == 25 || def == 27 || def == 29 || def == 35 || def == 14)
+        return baseDelay + 120;
+    return baseDelay;
+}
+
+static bool IsLocalFlashed(uintptr_t localPawn) {
+    if (!IsValid(localPawn)) return false;
+    float d = SafeRead<float>(localPawn + O::m_flFlashDuration, 0.f);
+    return d > g_config.triggerFlashMax;
+}
+
+static uintptr_t GetIdentityPtr(int idx);
+static bool DesignerNameEquals(uintptr_t identity, const char* want);
+
+static void UpdateSmokeNearby(uintptr_t localPawn) {
+    g_smokeNearby = false;
+    if (!IsValid(localPawn) || !g_pES) return;
+    if ((++g_smokeScanTick % 15) != 0) return; // rare scan
+    Vector3 eye = GetOrigin(localPawn);
+    Vector3 vo = GetViewOffset(localPawn);
+    eye.x += vo.x; eye.y += vo.y; eye.z += vo.z;
+    int highest = SafeRead<int>(g_pES + O::dwGameEntitySystem_highestEntityIndex, 512);
+    if (highest > 768) highest = 768;
+    for (int i = 64; i <= highest; i++) {
+        uintptr_t id = GetIdentityPtr(i);
+        if (!IsValid(id)) continue;
+        if (!DesignerNameEquals(id, "smokegrenade_projectile")) continue;
+        uintptr_t e = SafeRead<uintptr_t>(id, 0);
+        if (!IsValid(e)) continue;
+        Vector3 so = GetOrigin(e);
+        if (!OriginSane(so)) continue;
+        float dx = so.x - eye.x, dy = so.y - eye.y, dz = so.z - eye.z;
+        if (dx*dx + dy*dy + dz*dz < 144.f * 144.f) { g_smokeNearby = true; return; }
+    }
+}
+static bool IsLocalInSmoke(uintptr_t localPawn) {
+    (void)localPawn;
+    return g_smokeNearby;
+}
+
+
 static void GetWeaponName(uintptr_t pawn, char* buf, size_t len) {
     buf[0] = 0;
     uintptr_t wep = GetActiveWeapon(pawn);
@@ -834,29 +1003,30 @@ static void SetThirdPersonResetPatch(bool enable) {
 }
 
 void DoThirdPerson(uintptr_t localPawn) {
-    // Always restore patch if feature off / dead
-    if (!g_config.thirdPerson || !IsValid(localPawn) || !IsAlive(localPawn) || !hClient) {
+    // Original engine path (NOT OverrideView / guessed CViewSetup):
+    //   1) ThirdPersonReset JE->JMP while held (only if exact 0x75 found)
+    //   2) CSGOInput +0x229 thirdperson flag
+    if (!g_running || !g_config.thirdPerson || !IsValid(localPawn) || !IsAlive(localPawn) || !hClient) {
         SetThirdPersonResetPatch(false);
         return;
     }
 
     bool hold = (g_config.thirdPersonKey != 0) && IsKeyDown(g_config.thirdPersonKey);
 
-    // Code patch only when holding (and only if safe JE found)
-    SetThirdPersonResetPatch(hold);
+    if (Pat::g_res.thirdPersonReset)
+        SetThirdPersonResetPatch(hold);
+    else
+        SetThirdPersonResetPatch(false);
 
-    // Single CSGOInput flag write — no shotgun offsets, no float sprays
     uintptr_t input = 0;
     if (Pat::g_res.csgoInputPtr)
         input = Pat::ReadPtr(Pat::g_res.csgoInputPtr);
     if (!IsValid(input)) return;
-
-    // Only the commonly reported thirdperson bool; SEH guarded
     __try {
         SafeWrite<uint8_t>(input + 0x229, hold ? 1 : 0);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
+
 
 void DoNoFlash(uintptr_t p) {
 
@@ -946,21 +1116,20 @@ void DoNoSmoke(uintptr_t p) {
 // When NVR is on, soft RCS is skipped so they don't cancel each other.
 void DoNoVisualRecoil(uintptr_t p) {
     if (!g_config.noVisualRecoil || !IsValid(p)) return;
+    // Only while shots are in progress — zeroing punch every idle frame glitches viewangles
+    int shots = SafeRead<int>(p + O::m_iShotsFired, 0);
+    if (shots <= 0 && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000))
+        return;
+
     uintptr_t punch = SafeRead<uintptr_t>(p + O::m_pAimPunchServices, 0);
     if (!IsValid(punch)) return;
-
-    // Zero QAngle fields as raw floats (avoid struct layout surprises)
-    // NEVER write viewangles here — that causes camera glitches with aim/RCS.
-    auto zero_qangle = [&](std::ptrdiff_t off) {
+    auto zero_qangle = [&](uintptr_t off) {
         SafeWrite<float>(punch + off + 0, 0.f);
         SafeWrite<float>(punch + off + 4, 0.f);
         SafeWrite<float>(punch + off + 8, 0.f);
-        };
-    zero_qangle(O::AimPunch::m_predictableBaseAngle);     // 0x50
-    zero_qangle(O::AimPunch::m_predictableBaseAngleVel);  // 0x5C
-    zero_qangle(O::AimPunch::m_unpredictableBaseAngle);   // 0xA4
-
-    // Clear soft-RCS delta cache so toggling NVR/RCS does not snap
+    };
+    zero_qangle(O::AimPunch::m_predictableBaseAngle);
+    zero_qangle(O::AimPunch::m_predictableBaseAngleVel);
     g_rcsPunchX = 0.f;
     g_rcsPunchY = 0.f;
 }
@@ -968,42 +1137,12 @@ void DoNoVisualRecoil(uintptr_t p) {
 // Soft RCS – compensates a fraction of aim punch (legit style)
 // Disabled automatically while NoVisualRecoil is active (avoids camera glitch)
 void DoSoftRCS(uintptr_t localPawn) {
-    // NVR owns punch fully — soft RCS must not touch angles or punch cache
-    if (g_config.noVisualRecoil) {
-        g_rcsPunchX = 0.f;
-        g_rcsPunchY = 0.f;
-        return;
-    }
-    if (!g_config.rcsEnabled || !IsValid(localPawn) || !IsAlive(localPawn)) {
-        g_rcsPunchX = g_rcsPunchY = 0.f;
-        return;
-    }
-    int shots = SafeRead<int>(localPawn + O::m_iShotsFired, 0);
-    if (shots < g_config.rcsStartBullet) {
-        g_rcsPunchX = g_rcsPunchY = 0.f;
-        return;
-    }
-    uintptr_t punchSvc = SafeRead<uintptr_t>(localPawn + O::m_pAimPunchServices, 0);
-    if (!IsValid(punchSvc)) return;
-    Vector3 punch = SafeRead<Vector3>(punchSvc + O::AimPunch::m_predictableBaseAngle, {});
-    uintptr_t va = hClient + O::dwViewAngles;
-    if (!IsValid(va)) return;
-
-    // delta from previous punch * strength
-    float dx = (punch.x - g_rcsPunchX) * g_config.rcsStrength;
-    float dy = (punch.y - g_rcsPunchY) * g_config.rcsStrength;
-    g_rcsPunchX = punch.x;
-    g_rcsPunchY = punch.y;
-
-    __try {
-        Vector3 cur = *(Vector3*)va;
-        cur.x -= dx;
-        cur.y -= dy;
-        if (cur.x > 89.f) cur.x = 89.f;
-        if (cur.x < -89.f) cur.x = -89.f;
-        *(Vector3*)va = cur;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    // Soft RCS no longer writes dwViewAngles.
+    // Continuous angle writes were locking the camera to 1–2 angles even when not aiming.
+    // Use aimbot recoil-comp while aiming, or No Visual Recoil for visual punch only.
+    (void)localPawn;
+    g_rcsPunchX = 0.f;
+    g_rcsPunchY = 0.f;
 }
 
 // Trigger bone index (same mapping as aimbot)
@@ -1015,47 +1154,10 @@ static int TriggerBoneIndex() {
     }
 }
 
-// Apply punch compensation so the bullet path hits bonePos (CS2: visual punch ≈ *2)
+// Trigger never writes viewangles (was the aim jitter source when combined with aimbot).
 static void TriggerApplyRcsToBone(uintptr_t localPawn, const Vector3& bonePos) {
-    if (!g_config.triggerRcs || !hClient) return;
-    if (g_config.noVisualRecoil) return; // NVR already zeros punch
-
-    Vector3 eye = GetOrigin(localPawn);
-    Vector3 vo = GetViewOffset(localPawn);
-    eye.x += vo.x; eye.y += vo.y; eye.z += vo.z;
-    if (!OriginSane(eye) || !OriginSane(bonePos)) return;
-
-    Vector3 punch{};
-    uintptr_t punchSvc = SafeRead<uintptr_t>(localPawn + O::m_pAimPunchServices, 0);
-    if (IsValid(punchSvc))
-        punch = SafeRead<Vector3>(punchSvc + O::AimPunch::m_predictableBaseAngle, {});
-
-    // Angle to bone
-    Vector3 delta{ bonePos.x - eye.x, bonePos.y - eye.y, bonePos.z - eye.z };
-    float hyp = sqrtf(delta.x * delta.x + delta.y * delta.y);
-    if (hyp < 0.001f) return;
-    Vector3 targetAng;
-    targetAng.x = -atan2f(delta.z, hyp) * (180.f / 3.14159265f);
-    targetAng.y = atan2f(delta.y, delta.x) * (180.f / 3.14159265f);
-    targetAng.z = 0.f;
-
-    // Bullet travels along view + punch*2 → aim at bone - punch*2 * strength
-    float s = (std::clamp)(g_config.triggerRcsStrength, 0.f, 1.f);
-    targetAng.x -= punch.x * 2.f * s;
-    targetAng.y -= punch.y * 2.f * s;
-
-    if (targetAng.x > 89.f) targetAng.x = 89.f;
-    if (targetAng.x < -89.f) targetAng.x = -89.f;
-    while (targetAng.y > 180.f) targetAng.y -= 360.f;
-    while (targetAng.y < -180.f) targetAng.y += 360.f;
-
-    uintptr_t va = hClient + O::dwViewAngles;
-    if (!IsValid(va)) return;
-    __try {
-        if (!std::isnan(targetAng.x) && !std::isnan(targetAng.y))
-            *(Vector3*)va = targetAng;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    (void)localPawn; (void)bonePos;
+    // intentionally empty — trigger only presses attack
 }
 
 void DoTriggerbot(uintptr_t localPawn, int localTeam) {
@@ -1075,7 +1177,9 @@ void DoTriggerbot(uintptr_t localPawn, int localTeam) {
 
     // While attack is held: keep RCS locked on bone, then release
     if (attackHeld) {
-        if (g_config.triggerRcs && IsValid(holdTarget) && IsAlive(holdTarget) && IsValid(localPawn)) {
+        // Do not touch viewangles if aimbot is actively aiming
+        const bool aimBusy = g_config.aimEnabled && IsKeyDown(g_config.aimKey);
+        if (!aimBusy && g_config.triggerRcs && IsValid(holdTarget) && IsAlive(holdTarget) && IsValid(localPawn)) {
             Vector3 bonePos;
             if (GetBonePos(holdTarget, TriggerBoneIndex(), bonePos))
                 TriggerApplyRcsToBone(localPawn, bonePos);
@@ -1093,8 +1197,8 @@ void DoTriggerbot(uintptr_t localPawn, int localTeam) {
     if (!IsKeyDown(g_config.triggerKey)) return;
     if (!hClient) return;
 
-    float flash = SafeRead<float>(localPawn + O::m_flFlashDuration, 0.f);
-    if (flash > 0.4f) return;
+    if (g_config.triggerFlashCheck && IsLocalFlashed(localPawn)) return;
+    if (g_config.triggerSmokeCheck && IsLocalInSmoke(localPawn)) return;
     if (msSince(lastShotTime) < nextDelayMs) return;
 
     // ---- Entity under crosshair ----
@@ -1162,7 +1266,7 @@ void DoTriggerbot(uintptr_t localPawn, int localTeam) {
     int shots = SafeRead<int>(localPawn + O::m_iShotsFired, 0);
     if (shots >= 2)
         delay += 35 + shots * 6;
-    nextDelayMs = delay;
+    nextDelayMs = WeaponDelayProfileMs(localPawn, delay);
 }
 
 static Vector3 CalcAngles(const Vector3& s, const Vector3& d) {
@@ -1184,9 +1288,20 @@ static void NormAngles(Vector3& a) {
 
 
 void DoLegitAim(uintptr_t localPawn, int localTeam, int sw, int sh) {
+    // Sticky lock at function scope so we can clear on key-up
+    static uintptr_t lockPawn = 0;
+    static int lockBone = -1;
+    static int lockMiss = 0;
+
     if (!g_config.aimEnabled || !IsInGame()) return;
     if (!IsValid(localPawn) || !IsAlive(localPawn)) return;
-    if (!IsKeyDown(g_config.aimKey)) { g_hasTarget = false; return; }
+    if (!IsKeyDown(g_config.aimKey)) {
+        g_hasTarget = false;
+        lockPawn = 0;
+        lockBone = -1;
+        lockMiss = 0;
+        return;
+    }
     if (g_config.aimOnlyWhenScoped && !SafeRead<uint8_t>(localPawn + O::m_bIsScoped, 0)) return;
 
     uintptr_t va = hClient + O::dwViewAngles;
@@ -1197,63 +1312,130 @@ void DoLegitAim(uintptr_t localPawn, int localTeam, int sw, int sh) {
     Vector3 vo = GetViewOffset(localPawn);
     eye.x += vo.x; eye.y += vo.y; eye.z += vo.z;
 
-    float bestFov = g_config.aimFov;
-    Vector3 best{};
-    bool found = false;
-    // Bone priority order when enabled: preferred bone first, then head->neck->chest
-    int bonesTry[3];
-    int boneCount = 1;
-    bonesTry[0] = AimBoneIndex();
-    if (g_config.aimBonePriority) {
-        bonesTry[0] = O::Bone::head;
-        bonesTry[1] = O::Bone::neck;
-        bonesTry[2] = O::Bone::spine;
-        boneCount = 3;
+
+    int boneIdx = AimBoneIndex(); // fixed bone from menu — no priority flip while locked
+
+    auto bonePosOf = [&](uintptr_t pawn, int bone, Vector3& out) -> bool {
+        if (!GetBonePos(pawn, bone, out)) return false;
+        return OriginSane(out);
+    };
+
+    auto validTarget = [&](uintptr_t pawn) -> bool {
+        if (!IsValid(pawn) || pawn == localPawn || !IsAlive(pawn)) return false;
+        if (g_config.aimTeamCheck && Team(pawn) == localTeam) return false;
+        if (g_config.aimVisibleOnly && !IsSpotted(pawn)) return false;
+        return true;
+    };
+
+    auto screenFov = [&](const Vector3& bp, float& outFov) -> bool {
+        Vector2 scr;
+        if (!WorldToScreen(bp, scr, sw, sh, false)) return false;
+        float dx = scr.x - sw * 0.5f, dy = scr.y - sh * 0.5f;
+        outFov = sqrtf(dx * dx + dy * dy);
+        return true;
+    };
+
+    Vector3 aimPos{};
+    bool have = false;
+
+    // Try keep sticky target
+    if (lockPawn && validTarget(lockPawn)) {
+        Vector3 bp;
+        int b = (lockBone >= 0) ? lockBone : boneIdx;
+        if (bonePosOf(lockPawn, b, bp)) {
+            float fov = 9999.f;
+            if (screenFov(bp, fov) && fov < g_config.aimFov * 1.35f) {
+                aimPos = bp;
+                have = true;
+                lockMiss = 0;
+            } else {
+                lockMiss++;
+            }
+        } else {
+            lockMiss++;
+        }
+        if (lockMiss > 12) { lockPawn = 0; lockBone = -1; lockMiss = 0; }
+    } else {
+        lockPawn = 0;
+        lockBone = -1;
+        lockMiss = 0;
     }
 
-    auto consider = [&](uintptr_t pawn) {
-        for (int bi = 0; bi < boneCount; bi++) {
+    // Acquire new target if no lock
+    if (!have) {
+        float bestFov = g_config.aimFov;
+        uintptr_t bestPawn = 0;
+        Vector3 bestPos{};
+
+        Vector3 curAng = SafeRead<Vector3>(va, {});
+        auto consider = [&](uintptr_t pawn) {
+            if (!validTarget(pawn)) return;
             Vector3 bp;
-            if (!GetBonePos(pawn, bonesTry[bi], bp)) continue;
-            if (g_config.aimHumanize > 0.01f) {
-                float h = g_config.aimHumanize * 2.5f;
-                bp.x += RandF(-h, h); bp.y += RandF(-h, h); bp.z += RandF(-h * 0.5f, h * 0.5f);
+            if (!bonePosOf(pawn, boneIdx, bp)) {
+                if (boneIdx != O::Bone::head && bonePosOf(pawn, O::Bone::head, bp)) { }
+                else return;
             }
-            Vector2 scr;
-            if (!WorldToScreen(bp, scr, sw, sh)) continue;
-            float dx = scr.x - sw * 0.5f, dy = scr.y - sh * 0.5f;
-            float fov = sqrtf(dx * dx + dy * dy);
-            if (fov >= bestFov) continue;
-            Vector3 ang = CalcAngles(eye, bp);
-            NormAngles(ang);
-            bestFov = fov; best = ang; found = true;
-            return; // first bone in priority that is inside FOV wins
-        }
+            float fov = 0.f;
+            if (!screenFov(bp, fov)) {
+                // Angular FOV fallback if W2S fails (matrix lag)
+                Vector3 ang = CalcAngles(eye, bp);
+                NormAngles(ang);
+                float dpx = ang.x - curAng.x, dpy = ang.y - curAng.y;
+                while (dpy > 180.f) dpy -= 360.f;
+                while (dpy < -180.f) dpy += 360.f;
+                fov = sqrtf(dpx * dpx + dpy * dpy) * 12.f; // rough px scale
+            }
+            if (fov >= bestFov) return;
+            bestFov = fov;
+            bestPawn = pawn;
+            bestPos = bp;
         };
 
-    if (g_cacheCount > 0) {
-        for (int i = 0; i < g_cacheCount; i++) {
-            auto& c = g_cache[i];
-            if (!c.alive || c.pawn == localPawn) continue;
-            if (g_config.aimTeamCheck && c.team == localTeam) continue;
-            if (g_config.aimVisibleOnly && !IsSpotted(c.pawn)) continue;
-            consider(c.pawn);
+        if (g_cacheCount > 0) {
+            for (int i = 0; i < g_cacheCount; i++)
+                consider(g_cache[i].pawn);
+        } else {
+            for (int i = 1; i <= 64; i++) {
+                uintptr_t ctrl = GetEntity(i);
+                if (!ctrl) continue;
+                uintptr_t pawn = HandleToEnt(SafeRead<uint32_t>(ctrl + O::m_hPlayerPawn, 0));
+                consider(pawn);
+            }
         }
-    }
-    else {
-        for (int i = 1; i <= 64; i++) {
-            uintptr_t ctrl = GetEntity(i);
-            if (!ctrl) continue;
-            uintptr_t pawn = HandleToEnt(SafeRead<uint32_t>(ctrl + O::m_hPlayerPawn, 0));
-            if (!IsValid(pawn) || pawn == localPawn || !IsAlive(pawn)) continue;
-            if (g_config.aimTeamCheck && Team(pawn) == localTeam) continue;
-            if (g_config.aimVisibleOnly && !IsSpotted(pawn)) continue;
-            consider(pawn);
+
+        if (bestPawn) {
+            lockPawn = bestPawn;
+            lockBone = boneIdx;
+            aimPos = bestPos;
+            have = true;
+            lockMiss = 0;
         }
     }
 
-    if (!found) { g_hasTarget = false; return; }
+    if (!have) { g_hasTarget = false; return; }
     g_hasTarget = true;
+
+    // Refresh bone pos every frame for locked target (track movement)
+    {
+        Vector3 bp;
+        int b = (lockBone >= 0) ? lockBone : boneIdx;
+        if (bonePosOf(lockPawn, b, bp))
+            aimPos = bp;
+    }
+
+    Vector3 best = CalcAngles(eye, aimPos);
+    NormAngles(best);
+
+    if (g_config.aimRecoilComp) {
+        uintptr_t punchSvc = SafeRead<uintptr_t>(localPawn + O::m_pAimPunchServices, 0);
+        if (IsValid(punchSvc)) {
+            Vector3 punch = SafeRead<Vector3>(punchSvc + O::AimPunch::m_predictableBaseAngle, {});
+            float s = g_config.aimRecoilCompStr * 0.35f;
+            best.x -= punch.x * s;
+            best.y -= punch.y * s;
+            NormAngles(best);
+        }
+    }
     g_targetAngles = best;
 
     __try {
@@ -1263,19 +1445,28 @@ void DoLegitAim(uintptr_t localPawn, int localTeam, int sw, int sh) {
         while (dy > 180.f) dy -= 360.f;
         while (dy < -180.f) dy += 360.f;
 
-        // smooth: high value = slower movement (legit)
-        float factor = 1.f - (std::max)(0.05f, (std::min)(0.98f, g_config.aimSmooth));
-        // extra humanize on delta
-        if (g_config.aimHumanize > 0.01f) {
-            factor *= RandF(0.85f, 1.05f);
-        }
+        float angDist = sqrtf(dp * dp + dy * dy);
+        // Small deadzone only — still track moving targets
+        if (angDist < 0.04f) return;
+
+        float sm = g_config.aimSmooth;
+        if (sm < 0.05f) sm = 0.05f;
+        if (sm > 0.95f) sm = 0.95f;
+        float t = 1.f - sm;
+        if (angDist > 5.f) t = (std::min)(t * 1.5f, 0.7f);
+
+        float sx = dp * t;
+        float sy = dy * t;
+        const float kMaxStep = 4.0f;
+        if (sx > kMaxStep) sx = kMaxStep; if (sx < -kMaxStep) sx = -kMaxStep;
+        if (sy > kMaxStep) sy = kMaxStep; if (sy < -kMaxStep) sy = -kMaxStep;
 
         Vector3 n;
-        n.x = cur.x + dp * factor;
-        n.y = cur.y + dy * factor;
+        n.x = cur.x + sx;
+        n.y = cur.y + sy;
         n.z = 0.f;
         NormAngles(n);
-        if (!std::isnan(n.x) && !std::isnan(n.y))
+        if (!std::isnan(n.x) && !std::isnan(n.y) && fabsf(n.x) <= 89.f)
             *(Vector3*)va = n;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -1356,6 +1547,50 @@ void DrawSpectatorList(uintptr_t localPawn) {
         dl->AddText(ImVec2(x, y + 18 + i * 16), IM_COL32(235, 235, 240, 235), names[i]);
 }
 
+struct HitLogEntry {
+    float x, y, born;
+    int dmg;
+    char name[32];
+};
+static HitLogEntry g_hitlog[12];
+static int g_hitlogN = 0;
+
+static void PushHitlog(float sx, float sy, int dmg, const char* name) {
+    if (!g_config.hitlog) return;
+    HitLogEntry e{};
+    e.x = sx; e.y = sy; e.dmg = dmg;
+    e.born = (float)GetTickCount64();
+    e.name[0] = 0;
+    if (name) { strncpy_s(e.name, name, _TRUNCATE); }
+    if (g_hitlogN < 12) g_hitlog[g_hitlogN++] = e;
+    else {
+        for (int i = 1; i < 12; i++) g_hitlog[i-1] = g_hitlog[i];
+        g_hitlog[11] = e;
+    }
+}
+
+void DrawHitlog(ImDrawList* dl) {
+    if (!g_config.hitlog || !dl) return;
+    float now = (float)GetTickCount64();
+    int w = 0;
+    for (int i = 0; i < g_hitlogN; i++) {
+        float age = (now - g_hitlog[i].born) / 1000.f;
+        if (age > 2.2f) continue;
+        float a = 1.f - age / 2.2f;
+        int alpha = (int)(a * 255);
+        float yy = g_hitlog[i].y - age * 40.f;
+        char buf[64];
+        if (g_hitlog[i].name[0])
+            sprintf_s(buf, "-%d %s", g_hitlog[i].dmg, g_hitlog[i].name);
+        else
+            sprintf_s(buf, "-%d", g_hitlog[i].dmg);
+        dl->AddText(ImVec2(g_hitlog[i].x, yy), IM_COL32(255, 220, 80, alpha), buf);
+        g_hitlog[w++] = g_hitlog[i];
+    }
+    g_hitlogN = w;
+}
+
+
 // Hitmarker: detect HP drop on enemies while local recently fired
 static int g_prevEnemyHp[65];
 static int g_prevShotsFired = 0;
@@ -1411,6 +1646,17 @@ void UpdateHitmarker(uintptr_t localPawn, int localTeam) {
         if (firedRecently && g_prevEnemyHp[i] > 0 && hp >= 0 && hp < g_prevEnemyHp[i]) {
             g_hitMarkerActive = true;
             g_hitMarkerTime = std::chrono::steady_clock::now();
+            int dmg = g_prevEnemyHp[i] - hp;
+            float cx = ImGui::GetIO().DisplaySize.x * 0.5f;
+            float cy = ImGui::GetIO().DisplaySize.y * 0.5f;
+            // Prefer head screen if possible
+            Vector3 hp3; Vector2 scr;
+            int sw = (int)ImGui::GetIO().DisplaySize.x, sh = (int)ImGui::GetIO().DisplaySize.y;
+            if (GetBonePos(pawn, O::Bone::head, hp3) && WorldToScreen(hp3, scr, sw, sh)) {
+                cx = scr.x; cy = scr.y;
+            }
+            char nm[64]{}; GetPlayerName(ctrl, nm, sizeof(nm));
+            PushHitlog(cx, cy - 20.f, dmg, nm);
         }
         g_prevEnemyHp[i] = hp;
     }
@@ -1726,6 +1972,24 @@ void SetupImGuiStyle() {
 }
 
 // Smooth animated sidebar button with glowing active indicator
+
+static void ResetAimTab() {
+    g_config.aimEnabled = true; g_config.aimFov = 28.f; g_config.aimSmooth = 0.78f;
+    g_config.aimBone = 0; g_config.aimTeamCheck = true; g_config.aimVisibleOnly = true;
+    g_config.aimHumanize = 0.35f; g_config.aimRecoilComp = true; g_config.aimRecoilCompStr = 1.f;
+    g_config.rcsEnabled = true; g_config.rcsStrength = 0.55f; g_config.rcsStartBullet = 2;
+    g_config.punchUnified = true; g_config.earlyPunchPath = true;
+}
+static void ResetTriggerTab() {
+    g_config.triggerEnabled = false; g_config.triggerDelayMin = 45; g_config.triggerDelayMax = 95;
+    g_config.triggerWeaponProfiles = true; g_config.triggerFlashCheck = true;
+    g_config.triggerSmokeCheck = true; g_config.triggerRcs = true;
+}
+static void ResetVisualsTab() {
+    g_config.espEnabled = true; g_config.espBox = true; g_config.espYBias = 0.f;
+    g_config.espSkeleton = false; g_config.espSkeletonEveryOther = true;
+}
+
 static bool SidebarButton(const char* label, int id, int& current) {
     bool active = (current == id);
     ImGuiWindow* window = ImGui::GetCurrentWindow();
@@ -1992,9 +2256,11 @@ void DrawMenu() {
 
     if (g_menuTab == 0) {
         SectionHeader("AIMBOT");
+        if (ImGui::SmallButton("Reset aim tab")) ResetAimTab();
         ImGui::Checkbox("Enable", &g_config.aimEnabled);
         ImGui::SliderFloat("FOV", &g_config.aimFov, 5.f, 120.f, "%.0f px");
-        ImGui::SliderFloat("Smooth", &g_config.aimSmooth, 0.15f, 0.95f, "%.2f");
+        ImGui::SliderFloat("Smooth", &g_config.aimSmooth, 0.50f, 0.97f, "%.2f");
+        ImGui::TextDisabled("Hold Mouse5 (default). Smooth 0.6–0.8. Delete legit.ini after update.");
         ImGui::SliderFloat("Humanize", &g_config.aimHumanize, 0.f, 1.f, "%.2f");
         const char* bones[] = { "Head", "Neck", "Chest" };
         ImGui::Combo("Bone", &g_config.aimBone, bones, 3);
@@ -2021,16 +2287,20 @@ void DrawMenu() {
             ImGui::SameLine();
             if (ImGui::Button("LMB")) { g_config.aimKey = VK_LBUTTON; SaveConfig(); }
             ImGui::SameLine();
+            ImGui::TextDisabled("Avoid LMB — fights mouse while shooting");
+            ImGui::SameLine();
             if (ImGui::Button("M4")) { g_config.aimKey = VK_XBUTTON1; SaveConfig(); }
         }
 
         SectionHeader("SOFT RCS");
         ImGui::Checkbox("Enable RCS", &g_config.rcsEnabled);
-        ImGui::SliderFloat("Strength", &g_config.rcsStrength, 0.1f, 1.f, "%.2f");
+        ImGui::TextDisabled("Soft RCS angle write is disabled (was locking view). Use aim recoil-comp.");
+        ImGui::SliderFloat("Strength (unused)", &g_config.rcsStrength, 0.1f, 1.f, "%.2f");
         ImGui::SliderInt("Start bullet", &g_config.rcsStartBullet, 1, 6);
     }
     else if (g_menuTab == 1) {
         SectionHeader("TRIGGERBOT");
+        if (ImGui::SmallButton("Reset trigger tab")) ResetTriggerTab();
         ImGui::Checkbox("Enable", &g_config.triggerEnabled);
         const char* tbones[] = { "Head", "Neck", "Chest" };
         ImGui::Combo("Bone (only fire on)", &g_config.triggerBone, tbones, 3);
@@ -2068,6 +2338,7 @@ void DrawMenu() {
     }
     else if (g_menuTab == 2) {
         SectionHeader("ESP");
+        if (ImGui::SmallButton("Reset visuals tab")) ResetVisualsTab();
         ImGui::Checkbox("Enable ESP", &g_config.espEnabled);
         ImGui::Checkbox("Box", &g_config.espBox); ImGui::SameLine();
         ImGui::Checkbox("Outline", &g_config.espBoxOutline);
@@ -2082,6 +2353,11 @@ void DrawMenu() {
         ImGui::Checkbox("Visible only", &g_config.espVisibleOnly);
         ImGui::SliderFloat("Box thickness", &g_config.espBoxThickness, 0.8f, 3.f, "%.1f");
         ImGui::SliderFloat("Max distance (m)", &g_config.espMaxDistance, 15.f, 150.f, "%.0f");
+        ImGui::SliderFloat("ESP Y bias (px)", &g_config.espYBias, -40.f, 40.f, "%.0f");
+        ImGui::TextDisabled("+ shifts ESP down; - shifts ESP up");
+        ImGui::Checkbox("Skeleton every other frame", &g_config.espSkeletonEveryOther);
+        ImGui::Checkbox("ESP optimize (cache path)", &g_config.espOptimize);
+        ImGui::Checkbox("Entity cache lite", &g_config.entityCacheLite);
         ImGui::ColorEdit3("Enemy (hidden)", &g_config.espColorR);
         ImGui::ColorEdit3("Enemy (visible)", &g_config.espVisColorR);
     }
@@ -2092,12 +2368,32 @@ void DrawMenu() {
         ImGui::Checkbox("No Visual Recoil", &g_config.noVisualRecoil);
         ImGui::Checkbox("Spectator list", &g_config.spectatorList);
         ImGui::Checkbox("Hitmarker", &g_config.hitmarker);
+        ImGui::Checkbox("Hitlog (floating dmg)", &g_config.hitlog);
+        ImGui::Checkbox("Watermark", &g_config.watermark);
+        ImGui::Checkbox("FOV changer", &g_config.fovChanger);
+        if (g_config.fovChanger)
+            ImGui::SliderFloat("FOV", &g_config.fovValue, 70.f, 120.f, "%.0f");
+        ImGui::TextDisabled("Default OFF. Uses one CViewSetup FOV slot only.");
+        ImGui::Checkbox("Sniper crosshair (unscoped)", &g_config.sniperCrosshair);
+        ImGui::Checkbox("Bomb world ESP", &g_config.bombEsp);
+        ImGui::Checkbox("Nade prediction", &g_config.nadePred);
+        SectionHeader("ENVIRONMENT");
+        ImGui::Checkbox("Environment grade", &g_config.envEnabled);
+        if (g_config.envEnabled) {
+            const char* presets[] = { "Custom", "Night", "Warm", "Cold", "Dark", "Bright" };
+            if (g_config.envPreset < 0 || g_config.envPreset > 5) g_config.envPreset = 1;
+            ImGui::Combo("Preset", &g_config.envPreset, presets, 6);
+            ImGui::SliderFloat("Strength", &g_config.envStrength, 0.05f, 0.85f, "%.2f");
+            ImGui::TextDisabled("Writes C_EnvSky tint + brightness (env_sky entities).");
+        }
+        if (g_config.nadePred)
+            ImGui::SliderInt("Nade steps", &g_config.nadePredSteps, 15, 80);
         ImGui::Checkbox("Bomb timer (precise)", &g_config.bombTimer);
 
         SectionHeader("THIRD PERSON");
         ImGui::Checkbox("Enable third person", &g_config.thirdPerson);
-        ImGui::SliderFloat("TP distance", &g_config.thirdPersonDist, 40.f, 200.f, "%.0f");
-        ImGui::TextDisabled("Hold key to activate (release = first person).");
+        ImGui::TextDisabled("TP distance is unused on the engine path (kept for config compatibility).");
+        ImGui::TextDisabled("Hold key for engine third person (CSGOInput + ThirdPersonReset).");
         {
             static bool bindTp = false;
             ImGui::Text("Hold key:");
@@ -2125,7 +2421,7 @@ void DrawMenu() {
         ImGui::Checkbox("Movement indicators", &g_config.soundEsp);
         ImGui::SliderFloat("Min speed", &g_config.soundMinSpeed, 20.f, 250.f, "%.0f");
         ImGui::SliderFloat("Max distance (m)", &g_config.soundMaxDist, 5.f, 50.f, "%.0f");
-        ImGui::TextDisabled("Arrows for non-visible moving enemies.");
+        ImGui::TextDisabled("Arrows for non-visible enemies who are moving.");
 
         SectionHeader("CROSSHAIR");
         ImGui::Checkbox("Custom crosshair", &g_config.customCrosshair);
@@ -2145,6 +2441,22 @@ void DrawMenu() {
     }
     else if (g_menuTab == 5) {
         SectionHeader("CONFIG");
+        SectionHeader("PATTERN HEALTH");
+        auto patLine = [](const char* name, uintptr_t addr) {
+            ImGui::Text("%s", name);
+            ImGui::SameLine(180);
+            if (addr) ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, 1.f), "OK  %p", (void*)addr);
+            else ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.f), "MISS");
+        };
+        patLine("ViewMatrix", Pat::g_res.viewMatrix);
+        patLine("EntitySystem", Pat::g_res.gameEntitySystemPtr);
+        patLine("LocalController", Pat::g_res.localPlayerControllerPtr);
+        patLine("GlobalVars", Pat::g_res.globalVarsPtr);
+        patLine("DrawSmokeArray", Pat::g_res.drawSmokeArray);
+        patLine("CSGOInput", Pat::g_res.csgoInputPtr);
+        patLine("ThirdPersonReset", Pat::g_res.thirdPersonReset);
+        ImGui::TextDisabled("END = features on/off (DLL stays). Hooks removed only on real FreeLibrary.");
+        ImGui::Spacing();
         if (ImGui::Button("Save", ImVec2(110, 32))) SaveConfig();
         ImGui::SameLine();
         if (ImGui::Button("Load", ImVec2(110, 32))) LoadConfig();
@@ -2156,7 +2468,7 @@ void DrawMenu() {
         ImGui::Spacing();
         ImGui::TextDisabled("%s", GetConfigPath().c_str());
         ImGui::Spacing();
-        ImGui::TextColored(ImVec4(0.95f, 0.40f, 0.38f, 1.f), "Legit preset tips:");
+        ImGui::TextColored(ImVec4(0.95f, 0.40f, 0.38f, 1.f), "Legit tips:");
         ImGui::BulletText("Smooth 0.70–0.85 · FOV 20–35");
         ImGui::BulletText("Humanize ~0.3 · RCS strength ~0.5");
         ImGui::BulletText("Trigger delay 25–60 ms random");
@@ -2170,7 +2482,229 @@ void DrawMenu() {
 }
 
 // -------------------- MAIN FRAME --------------------
+
+// -------------------- WATERMARK / FOV / BOMB ESP / NADE / SNIPER CH --------------------
+
+
+// C_EnvSky (client schema)
+namespace EnvSky {
+    constexpr uintptr_t m_vTintColor = 0xFC1;             // Color RGBA bytes
+    constexpr uintptr_t m_vTintColorLightingOnly = 0xFC5;
+    constexpr uintptr_t m_flBrightnessScale = 0xFCC;      // float
+}
+
+static void WriteSkyTint(uintptr_t sky, uint8_t r, uint8_t g, uint8_t b, uint8_t a, float brightness) {
+    if (!IsValid(sky)) return;
+    __try {
+        uint8_t* c = (uint8_t*)(sky + EnvSky::m_vTintColor);
+        c[0] = r; c[1] = g; c[2] = b; c[3] = a;
+        uint8_t* c2 = (uint8_t*)(sky + EnvSky::m_vTintColorLightingOnly);
+        c2[0] = r; c2[1] = g; c2[2] = b; c2[3] = a;
+        *(float*)(sky + EnvSky::m_flBrightnessScale) = brightness;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+void DoEnvironmentSky() {
+    if (!g_config.envEnabled || !g_pES || !IsInGame()) return;
+    static int tick = 0;
+    if ((++tick % 20) != 0) return; // no need every frame
+
+    uint8_t r = 255, g = 255, b = 255, a = 255;
+    float bright = 1.f;
+    float s = g_config.envStrength;
+    if (s < 0.05f) s = 0.05f;
+    if (s > 1.f) s = 1.f;
+    switch (g_config.envPreset) {
+    case 1: // Night
+        r = (uint8_t)(30 + 40 * (1.f - s)); g = (uint8_t)(40 + 40 * (1.f - s)); b = (uint8_t)(80 + 50 * (1.f - s));
+        bright = 1.f - 0.7f * s; break;
+    case 2: // Warm
+        r = 255; g = (uint8_t)(180 - 60 * s); b = (uint8_t)(120 - 80 * s); bright = 1.f; break;
+    case 3: // Cold
+        r = (uint8_t)(120 - 40 * s); g = (uint8_t)(160 - 20 * s); b = 255; bright = 1.f; break;
+    case 4: // Dark
+        r = g = b = (uint8_t)(255 * (1.f - 0.85f * s)); bright = 1.f - 0.8f * s; break;
+    case 5: // Bright
+        r = g = b = 255; bright = 1.f + 1.5f * s; break;
+    default:
+        return;
+    }
+
+    int highest = SafeRead<int>(g_pES + O::dwGameEntitySystem_highestEntityIndex, 512);
+    if (highest > 2048) highest = 2048;
+    for (int i = 64; i <= highest; i++) {
+        uintptr_t id = GetIdentityPtr(i);
+        if (!IsValid(id)) continue;
+        if (!DesignerNameEquals(id, "env_sky")) continue;
+        uintptr_t ent = SafeRead<uintptr_t>(id, 0);
+        if (!IsValid(ent)) continue;
+        WriteSkyTint(ent, r, g, b, a, bright);
+    }
+}
+
+
+void DrawEnvironmentGrade_UNUSED(ImDrawList* dl) {
+    if (!g_config.envEnabled || !dl) return;
+    float a = g_config.envStrength;
+    if (a < 0.f) a = 0.f;
+    if (a > 0.85f) a = 0.85f;
+    int ai = (int)(a * 255.f);
+    ImU32 col = IM_COL32(0, 0, 0, 0);
+    switch (g_config.envPreset) {
+    case 1: col = IM_COL32(10, 20, 50, ai); break;      // Night blue
+    case 2: col = IM_COL32(60, 30, 10, ai); break;      // Warm
+    case 3: col = IM_COL32(10, 40, 60, ai); break;      // Cold
+    case 4: col = IM_COL32(0, 0, 0, ai); break;         // Dark
+    case 5: col = IM_COL32(255, 255, 230, (int)(a * 40.f)); break; // Bright wash
+    default: return;
+    }
+    ImVec2 ds = ImGui::GetIO().DisplaySize;
+    dl->AddRectFilled(ImVec2(0, 0), ds, col);
+}
+
+void DrawWatermark(ImDrawList* dl) {
+    if (!g_config.watermark || !dl) return;
+    float fps = ImGui::GetIO().Framerate;
+    int ok = 0, total = 7;
+    if (Pat::g_res.viewMatrix) ok++;
+    if (Pat::g_res.gameEntitySystemPtr) ok++;
+    if (Pat::g_res.localPlayerControllerPtr) ok++;
+    if (Pat::g_res.globalVarsPtr) ok++;
+    if (Pat::g_res.drawSmokeArray) ok++;
+    if (Pat::g_res.csgoInputPtr) ok++;
+    if (Pat::g_res.thirdPersonReset) ok++;
+    char buf[128];
+    sprintf_s(buf, g_featuresEnabled
+        ? "rakhus  |  %.0f fps  |  patterns %d/%d"
+        : "rakhus  |  FEATURES OFF (END)  |  %.0f fps  |  %d/%d",
+        fps, ok, total);
+    ImVec2 ts = ImGui::CalcTextSize(buf);
+    float x = 12.f, y = 10.f;
+    dl->AddRectFilled(ImVec2(x - 6, y - 4), ImVec2(x + ts.x + 6, y + ts.y + 4), IM_COL32(12, 14, 20, 200), 6.f);
+    ImU32 col = (ok >= 5) ? IM_COL32(120, 220, 160, 255) : IM_COL32(255, 160, 80, 255);
+    dl->AddText(ImVec2(x, y), col, buf);
+}
+
+void DrawSniperCrosshair(ImDrawList* dl, uintptr_t localPawn) {
+    if (!g_config.sniperCrosshair || !IsValid(localPawn) || !dl) return;
+    uintptr_t wep = GetActiveWeapon(localPawn);
+    if (!IsValid(wep)) return;
+    uint16_t def = SafeRead<uint16_t>(wep + O::m_AttributeManager + O::m_Item + O::m_iItemDefinitionIndex, 0);
+    // AWP, SSG, SCAR, G3
+    if (!(def == 9 || def == 40 || def == 38 || def == 11)) return;
+    if (SafeRead<uint8_t>(localPawn + O::m_bIsScoped, 0)) return;
+    ImVec2 c(ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.5f);
+    ImU32 col = IM_COL32(0, 255, 100, 220);
+    float s = 4.f;
+    dl->AddLine(ImVec2(c.x - s, c.y), ImVec2(c.x + s, c.y), col, 1.2f);
+    dl->AddLine(ImVec2(c.x, c.y - s), ImVec2(c.x, c.y + s), col, 1.2f);
+}
+
+// Shared planted C4 resolve
+static uintptr_t ResolvePlantedC4() {
+    if (!hClient) return 0;
+    uintptr_t slot = SafeRead<uintptr_t>(hClient + O::dwPlantedC4, 0);
+    uintptr_t c4 = 0;
+    if (IsValid(slot)) {
+        c4 = SafeRead<uintptr_t>(slot, 0);
+        if (!IsValid(c4)) c4 = slot;
+    }
+    return IsValid(c4) ? c4 : 0;
+}
+
+void DrawBombWorldEsp(ImDrawList* dl, int sw, int sh) {
+    if (!g_config.bombEsp || !dl) return;
+    uintptr_t c4 = ResolvePlantedC4();
+    if (!IsValid(c4)) return;
+    uint8_t ticking = SafeRead<uint8_t>(c4 + O::C4::m_bBombTicking, 0);
+    if (!ticking) return;
+    Vector3 o = GetOrigin(c4);
+    if (!OriginSane(o)) return;
+    Vector2 s;
+    if (!WorldToScreen(o, s, sw, sh)) return;
+    float blow = SafeRead<float>(c4 + O::C4::m_flC4Blow, 0.f);
+    float cur = GetCurTime();
+    float remain = (blow > 1.f && cur > 1.f) ? (blow - cur) : -1.f;
+    char buf[48];
+    if (remain >= 0.f && remain < 60.f) sprintf_s(buf, "C4  %.1fs", remain);
+    else sprintf_s(buf, "C4");
+    ImU32 col = remain >= 0.f && remain < 10.f ? IM_COL32(255, 60, 60, 255) : IM_COL32(255, 200, 60, 255);
+    ImVec2 ts = ImGui::CalcTextSize(buf);
+    dl->AddRectFilled(ImVec2(s.x - ts.x * 0.5f - 6, s.y - 18), ImVec2(s.x + ts.x * 0.5f + 6, s.y + 4), IM_COL32(0, 0, 0, 160), 4.f);
+    dl->AddText(ImVec2(s.x - ts.x * 0.5f, s.y - 16), col, buf);
+    dl->AddCircle(ImVec2(s.x, s.y), 5.f, col, 12, 1.5f);
+}
+
+void DrawNadePrediction(ImDrawList* dl, uintptr_t localPawn, int sw, int sh) {
+    if (!g_config.nadePred || !IsValid(localPawn) || !dl) return;
+    uintptr_t wep = GetActiveWeapon(localPawn);
+    if (!IsValid(wep)) return;
+    uint16_t def = SafeRead<uint16_t>(wep + O::m_AttributeManager + O::m_Item + O::m_iItemDefinitionIndex, 0);
+    // HE 44, flash 43, smoke 45, molly 46/48, decoy 47
+    bool isNade = (def == 43 || def == 44 || def == 45 || def == 46 || def == 47 || def == 48);
+    if (!isNade) return;
+
+    Vector3 eye = GetOrigin(localPawn);
+    Vector3 vo = GetViewOffset(localPawn);
+    eye.x += vo.x; eye.y += vo.y; eye.z += vo.z;
+    uintptr_t va = hClient + O::dwViewAngles;
+    Vector3 ang = SafeRead<Vector3>(va, {});
+    float pitch = ang.x * (3.14159265f / 180.f);
+    float yaw = ang.y * (3.14159265f / 180.f);
+    Vector3 fwd{
+        cosf(pitch) * cosf(yaw),
+        cosf(pitch) * sinf(yaw),
+        -sinf(pitch)
+    };
+    // Approximate throw velocity
+    float speed = 750.f;
+    Vector3 vel{ fwd.x * speed, fwd.y * speed, fwd.z * speed + 200.f };
+    Vector3 pos = eye;
+    pos.x += fwd.x * 16.f; pos.y += fwd.y * 16.f; pos.z += fwd.z * 16.f;
+    float dt = 0.05f;
+    Vector2 prev{};
+    bool hasPrev = false;
+    int steps = g_config.nadePredSteps;
+    if (steps < 10) steps = 10;
+    if (steps > 80) steps = 80;
+    for (int i = 0; i < steps; i++) {
+        pos.x += vel.x * dt;
+        pos.y += vel.y * dt;
+        pos.z += vel.z * dt;
+        vel.z -= 800.f * dt; // gravity approx
+        Vector2 scr;
+        if (!WorldToScreen(pos, scr, sw, sh)) { hasPrev = false; continue; }
+        if (hasPrev)
+            dl->AddLine(ImVec2(prev.x, prev.y), ImVec2(scr.x, scr.y), IM_COL32(100, 200, 255, 180), 1.5f);
+        prev = scr; hasPrev = true;
+        if (pos.z < eye.z - 300.f) break;
+    }
+}
+
+// OverrideView hook — FOV + third person camera
+typedef void(__fastcall* OverrideViewFn)(void*, void*);
+static OverrideViewFn oOverrideView = nullptr;
+static bool g_ovHooked = false;
+
+// CViewSetup-ish offsets (community layout; may drift by build)
+
+void __fastcall hkOverrideView(void* a1, void* setup) {
+    if (oOverrideView) oOverrideView(a1, setup);
+    if (!setup || !g_running || !g_featuresEnabled || g_unloadRequested) return;
+    if (!g_config.fovChanger) return;
+    // Single common FOV slot only (multi-offset writes caused camera glitches)
+    __try {
+        float* fov = (float*)((uintptr_t)setup + 0x4B8);
+        float cur = *fov;
+        if (cur >= 60.f && cur <= 130.f)
+            *fov = g_config.fovValue;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+
 void DrawFrame() {
+    if (!g_running) return;
+
     // NOTE: no C++ try/catch here — MSVC forbids mixing with __try in callees/helpers
     if (!g_imGuiInitialized || !hClient) return;
     ImGui_ImplDX11_NewFrame();
@@ -2202,49 +2736,67 @@ void DrawFrame() {
     if (IsInGame())
         pLocal = SafeRead<uintptr_t>(hClient + O::dwLocalPlayerPawn, 0);
 
-    if (IsValid(pLocal) && IsAlive(pLocal) && IsInGame()) {
+    // END toggles features; menu/watermark still work
+    if (g_featuresEnabled && IsValid(pLocal) && IsAlive(pLocal) && IsInGame()) {
         int localTeam = Team(pLocal);
         DoNoFlash(pLocal);
         DoNoSmoke(pLocal);
         DoThirdPerson(pLocal);
-        DoSoftRCS(pLocal);
-        DoNoVisualRecoil(pLocal);
+        UpdateSmokeNearby(pLocal);
+        DoEnvironmentSky();
+        // Early punch path (CreateMove-style ordering before ESP)
+        if (g_config.earlyPunchPath) {
+            DoNoVisualRecoil(pLocal);
+            DoSoftRCS(pLocal);
+        } else {
+            DoSoftRCS(pLocal);
+            DoNoVisualRecoil(pLocal);
+        }
         DoTriggerbot(pLocal, localTeam);
         UpdateHitmarker(pLocal, localTeam);
         DoGlow(pLocal, localTeam);
 
-        if (g_config.espEnabled) {
-            for (int i = 1; i <= 64; i++) {
-                uintptr_t ctrl = GetEntity(i);
-                if (!IsValid(ctrl)) continue;
-                if (!ControllerPawnAlive(ctrl)) continue; // disconnect / leave filter
+        if (g_config.espEnabled && g_cacheCount > 0) {
+            // Use entity cache (no second 1..64 entity walk — major lag fix)
+            static int s_espFrame = 0;
+            s_espFrame++;
+            bool doSkeletonThisFrame = !g_config.espSkeletonEveryOther || (s_espFrame & 1);
 
-                uintptr_t pawn = HandleToEnt(SafeRead<uint32_t>(ctrl + O::m_hPlayerPawn, 0));
-                if (!IsValid(pawn) || pawn == pLocal || !IsAlive(pawn)) continue;
+            Vector3 eye = GetOrigin(pLocal);
+            eye.z += GetViewOffset(pLocal).z;
+
+            for (int ci = 0; ci < g_cacheCount; ci++) {
+                auto& c = g_cache[ci];
+                uintptr_t pawn = c.pawn;
+                uintptr_t ctrl = c.ctrl;
+                if (!IsValid(pawn) || pawn == pLocal || !c.alive) continue;
+                if (g_config.espTeamCheck && c.team == localTeam) continue;
 
                 Vector3 feet = GetOrigin(pawn);
-                if (!OriginSane(feet)) continue; // ghost at 0,0,0 after leave
+                if (!OriginSane(feet)) continue;
 
-                if (g_config.espTeamCheck && Team(pawn) == localTeam) continue;
                 bool vis = IsSpotted(pawn);
                 if (g_config.espVisibleOnly && !vis) continue;
 
-                feet.z += 4.f; // visual sole lift — abs origin sits slightly under model
+                // Cheap distance from feet first (skip bone if too far)
+                float dx = feet.x - eye.x, dy = feet.y - eye.y, dz = feet.z - eye.z;
+                float distM = sqrtf(dx * dx + dy * dy + dz * dz) * 0.01905f;
+                if (distM > g_config.espMaxDistance) continue;
+
+                feet.z += 4.f;
                 Vector3 head;
                 if (!GetBonePos(pawn, O::Bone::head, head)) continue;
-                // head already includes crouch-aware height; small extra so box clears helmet
                 head.z += 2.f;
                 if (!OriginSane(head)) continue;
 
-                Vector3 eye = GetOrigin(pLocal);
-                eye.z += GetViewOffset(pLocal).z;
-                float distM = sqrtf((head.x - eye.x) * (head.x - eye.x) + (head.y - eye.y) * (head.y - eye.y) + (head.z - eye.z) * (head.z - eye.z)) * 0.01905f;
-                if (distM > g_config.espMaxDistance) continue;
-
                 Vector2 sf, shs;
-                if (!WorldToScreen(feet, sf, sw, sh) || !WorldToScreen(head, shs, sw, sh)) continue;
+                if (!WorldToScreen(feet, sf, sw, sh, true) || !WorldToScreen(head, shs, sw, sh, true)) continue;
+
+                // Off-screen cull with small margin
+                if (shs.x < -80 || shs.x > sw + 80 || sf.y < -80 || shs.y > sh + 80) continue;
+
                 float h = sf.y - shs.y;
-                if (h < 6.f) continue;
+                if (h < 6.f || h > sh * 1.5f) continue;
                 float w = h * 0.42f;
                 float x = shs.x - w * 0.5f, y = shs.y;
 
@@ -2258,43 +2810,41 @@ void DrawFrame() {
                     dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h), col, 0.f, 0, g_config.espBoxThickness);
                 }
                 if (g_config.espHeadDot) {
-                    Vector2 hd;
-                    Vector3 hp; GetBonePos(pawn, O::Bone::head, hp);
-                    if (WorldToScreen(hp, hd, sw, sh))
-                        dl->AddCircleFilled(ImVec2(hd.x, hd.y), 2.2f, col);
+                    // reuse head screen pos — no second GetBonePos/W2S
+                    dl->AddCircleFilled(ImVec2(shs.x, shs.y), 2.2f, col);
                 }
                 if (g_config.espHealth) {
-                    int hp = (std::clamp)(HP(pawn), 0, 100);
+                    int hp = (std::clamp)(c.hp > 0 ? c.hp : HP(pawn), 0, 100);
                     float bh = h * (hp / 100.f);
                     ImU32 hc = hp > 60 ? IM_COL32(50, 210, 90, 255) : hp > 30 ? IM_COL32(230, 190, 40, 255) : IM_COL32(230, 55, 55, 255);
                     dl->AddRectFilled(ImVec2(x - 5, y + h - bh), ImVec2(x - 2, y + h), hc);
                     dl->AddRect(ImVec2(x - 5, y), ImVec2(x - 2, y + h), IM_COL32(0, 0, 0, 160));
                 }
-                if (g_config.espArmor && Armor(pawn) > 0) {
-                    float bh = h * ((std::clamp)(Armor(pawn), 0, 100) / 100.f);
-                    dl->AddRectFilled(ImVec2(x + w + 2, y + h - bh), ImVec2(x + w + 5, y + h), IM_COL32(70, 140, 255, 230));
+                if (g_config.espArmor) {
+                    int ar = Armor(pawn);
+                    if (ar > 0) {
+                        float bh = h * ((std::clamp)(ar, 0, 100) / 100.f);
+                        dl->AddRectFilled(ImVec2(x + w + 2, y + h - bh), ImVec2(x + w + 5, y + h), IM_COL32(70, 140, 255, 230));
+                    }
                 }
                 float ty = y - 13.f;
-                if (g_config.espName) {
-                    char name[128]; GetPlayerName(ctrl, name, sizeof(name));
-                    if (name[0]) {
-                        ImVec2 ts = ImGui::CalcTextSize(name);
-                        dl->AddText(ImVec2(shs.x - ts.x * 0.5f, ty), IM_COL32(240, 240, 245, 235), name);
-                        ty -= 13.f;
-                    }
+                UpdatePlayerTextCache(c);
+                if (g_config.espName && c.name[0]) {
+                    ImVec2 ts = ImGui::CalcTextSize(c.name);
+                    dl->AddText(ImVec2(shs.x - ts.x * 0.5f, ty), IM_COL32(240, 240, 245, 235), c.name);
+                    ty -= 13.f;
                 }
-                if (g_config.espWeapon) {
-                    char wn[64]; GetWeaponName(pawn, wn, sizeof(wn));
-                    if (wn[0]) {
-                        ImVec2 ts = ImGui::CalcTextSize(wn);
-                        dl->AddText(ImVec2(shs.x - ts.x * 0.5f, y + h + 2), IM_COL32(190, 190, 200, 210), wn);
-                    }
+                if (g_config.espWeapon && c.weapon[0]) {
+                    ImVec2 ts = ImGui::CalcTextSize(c.weapon);
+                    dl->AddText(ImVec2(shs.x - ts.x * 0.5f, y + h + 2), IM_COL32(190, 190, 200, 210), c.weapon);
                 }
                 if (g_config.espDistance) {
                     char dt[16]; sprintf_s(dt, "%.0fm", distM);
                     dl->AddText(ImVec2(x, y + h + (g_config.espWeapon ? 15.f : 2.f)), IM_COL32(170, 170, 180, 190), dt);
                 }
-                if (g_config.espSkeleton) DrawSkeleton(dl, pawn, sw, sh, col);
+                // Skeleton: optional every-other-frame + distance gate
+                if (g_config.espSkeleton && doSkeletonThisFrame && distM < 45.f)
+                    DrawSkeleton(dl, pawn, sw, sh, col);
             }
         }
 
@@ -2303,6 +2853,11 @@ void DrawFrame() {
         DrawFovCircle(dl);
         DrawCrosshair(dl);
         DrawBombTimer(dl);
+        DrawBombWorldEsp(dl, sw, sh);
+        DrawWatermark(dl);
+        DrawSniperCrosshair(dl, pLocal);
+        DrawNadePrediction(dl, pLocal, sw, sh);
+        DrawHitlog(dl);
         DrawSoundEsp(dl, pLocal, localTeam, sw, sh);
         DoLegitAim(pLocal, localTeam, sw, sh);
     }
@@ -2310,6 +2865,9 @@ void DrawFrame() {
         DrawSpectatorList(pLocal);
     }
 
+    // Always: status watermark + menu (works while features OFF)
+    if (!g_featuresEnabled && dl)
+        DrawWatermark(dl);
     DrawMenu();
 
     ImGui::EndFrame();
@@ -2325,6 +2883,9 @@ typedef HRESULT(__stdcall* Present)(IDXGISwapChain*, UINT, UINT);
 static Present oPresent = nullptr;
 
 HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags) {
+    if (!g_running || g_unloadRequested)
+        return oPresent ? oPresent(pSwapChain, SyncInterval, Flags) : S_OK;
+    InterlockedIncrement(&g_presentBusy);
     try {
         if (!g_imGuiInitialized) {
             if (SUCCEEDED(pSwapChain->GetDevice(__uuidof(ID3D11Device), (void**)&g_pd3dDevice))) {
@@ -2361,7 +2922,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
                     g_imGuiInitialized = true;
                     g_OriginalWndProc = (WNDPROC)SetWindowLongPtr(g_gameHwnd, GWLP_WNDPROC, (LONG_PTR)HookedWndProc);
                     LoadConfig();
-                    LOG("[+] rak-hus-legit premium UI ready");
+                    LOG("[+] rakhus-legit UI ready");
                 }
             }
         }
@@ -2373,6 +2934,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         if (g_imGuiInitialized && g_mainRenderTargetView) DrawFrame();
     }
     catch (...) {}
+    InterlockedDecrement(&g_presentBusy);
     return oPresent(pSwapChain, SyncInterval, Flags);
 }
 
@@ -2384,7 +2946,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
 
 DWORD WINAPI MainLoop(LPVOID) {
     srand((unsigned)time(nullptr));
-    LOG("[*] legit main");
+    LOG("[*] rakhus-legit main");
     for (int i = 0; i < 80; i++) {
         Sleep(100);
         if (HMODULE h = GetModuleHandleA("client.dll")) {
@@ -2411,6 +2973,18 @@ DWORD WINAPI MainLoop(LPVOID) {
     else {
         LOG("[-] pattern resolve incomplete — using static offsets");
     }
+
+    // OverrideView — FOV changer (single offset, default off)
+    if (Pat::g_res.overrideView) {
+        MH_STATUS mh = MH_Initialize();
+        if (mh == MH_OK || mh == MH_ERROR_ALREADY_INITIALIZED) {
+            if (MH_CreateHook((LPVOID)Pat::g_res.overrideView, (LPVOID)&hkOverrideView, (LPVOID*)&oOverrideView) == MH_OK
+                && MH_EnableHook((LPVOID)Pat::g_res.overrideView) == MH_OK) {
+                g_ovHooked = true;
+                LOG("[+] OverrideView hooked (FOV)");
+            } else LOG("[-] OverrideView hook failed");
+        }
+    } else LOG("[-] OverrideView pattern miss");
 
     // Hook DrawSmokeArray for crash-free NoSmoke
     if (Pat::g_res.drawSmokeArray) {
@@ -2441,21 +3015,90 @@ DWORD WINAPI MainLoop(LPVOID) {
     } while (!ok);
 
     bool lastIns = false;
-    while (true) {
+    bool lastEnd = false;
+    while (g_running) {
         bool ins = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
         if (ins && !lastIns) g_config.showMenu = !g_config.showMenu;
         lastIns = ins;
+
+        // END = toggle features only — DLL stays loaded, hooks stay, no FreeLibrary
+        bool endKey = (GetAsyncKeyState(VK_END) & 0x8000) != 0;
+        if (endKey && !lastEnd) {
+            g_featuresEnabled = !g_featuresEnabled;
+            if (!g_featuresEnabled) {
+                SetThirdPersonResetPatch(false);
+                LOG("[*] END — features OFF (DLL still loaded). Press END again to re-enable.");
+            } else {
+                LOG("[*] END — features ON");
+            }
+        }
+        lastEnd = endKey;
         Sleep(16);
     }
 }
+
+
+// Unhook everything — call only when DLL is really leaving (DETACH), after Present is idle
+static void SafeUnhookAll() {
+    g_featuresEnabled = false;
+    g_unloadRequested = true;
+    g_running = false;
+
+    for (int i = 0; i < 150 && InterlockedCompareExchange(&g_presentBusy, 0, 0) != 0; i++)
+        Sleep(10);
+
+    SetThirdPersonResetPatch(false);
+
+    if (g_gameHwnd && g_OriginalWndProc) {
+        SetWindowLongPtr(g_gameHwnd, GWLP_WNDPROC, (LONG_PTR)g_OriginalWndProc);
+        g_OriginalWndProc = nullptr;
+    }
+
+    if (g_ovHooked && Pat::g_res.overrideView) {
+        MH_DisableHook((LPVOID)Pat::g_res.overrideView);
+        MH_RemoveHook((LPVOID)Pat::g_res.overrideView);
+        g_ovHooked = false;
+    }
+    if (Pat::g_res.drawSmokeArray) {
+        MH_DisableHook((LPVOID)Pat::g_res.drawSmokeArray);
+        MH_RemoveHook((LPVOID)Pat::g_res.drawSmokeArray);
+    }
+
+    // Present unbind — kiero shutdown removes index 8 hook
+    __try {
+        kiero::shutdown();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    oPresent = nullptr;
+
+    if (g_imGuiInitialized) {
+        __try {
+            ImGui_ImplDX11_Shutdown();
+            ImGui_ImplWin32_Shutdown();
+            ImGui::DestroyContext();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        g_imGuiInitialized = false;
+    }
+    // Do NOT Release game device/swapchain — game owns them
+    g_mainRenderTargetView = nullptr;
+    g_pd3dDeviceContext = nullptr;
+    g_pd3dDevice = nullptr;
+
+    FreeConsole();
+}
+
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_hModule = hModule;
         DisableThreadLibraryCalls(hModule);
         InitConsole();
-        LOG("[+] rak-hus-legit loaded");
+        LOG("[+] rakhus-legit loaded");
         CreateThread(NULL, 0, MainLoop, NULL, 0, NULL);
+    }
+    else if (reason == DLL_PROCESS_DETACH) {
+        // Real unload (injector FreeLibrary) — remove hooks safely
+        SafeUnhookAll();
     }
     return TRUE;
 }
