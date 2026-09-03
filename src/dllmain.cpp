@@ -126,6 +126,8 @@ struct Config {
     bool triggerRcs = false;         // off by default — was fighting aimbot
     float triggerRcsStrength = 1.0f; // 0–1 full punch compensation
     float triggerBoneFov = 12.f;     // max pixels: bone must be this close to crosshair
+    bool triggerHitchance = true;      // gate fire by estimated hit chance
+    float triggerHitchanceMin = 55.f;  // only fire if HC >= this %
     bool triggerWeaponProfiles = true; // AWP slower / pistol faster delays
     bool triggerFlashCheck = true;     // don't fire while flashed
     bool triggerSmokeCheck = true;     // don't fire while in smoke cloud
@@ -177,10 +179,11 @@ struct Config {
     float soundMaxDist = 25.f;
 
 
-    // Third person (hold key)
-    bool thirdPerson = false;      // off by default (safer)
+    // Third person (hold or toggle)
+    bool thirdPerson = false;      // master enable
+    bool thirdPersonToggle = false; // false = hold key, true = toggle on key press
     int  thirdPersonKey = 0x05;  // VK_XBUTTON1 default (Mouse 4)
-    float thirdPersonDist = 120.f;
+    float thirdPersonDist = 120.f; // reserved / future OverrideView distance
 
     // Watermark / UI
     bool watermark = true;
@@ -285,6 +288,8 @@ void SaveConfig() {
     w("triggerRcs", g_config.triggerRcs ? 1 : 0);
     w("triggerRcsStrength", g_config.triggerRcsStrength);
     w("triggerBoneFov", g_config.triggerBoneFov);
+    w("triggerHitchance", g_config.triggerHitchance ? 1 : 0);
+    w("triggerHitchanceMin", g_config.triggerHitchanceMin);
     w("triggerWeaponProfiles", g_config.triggerWeaponProfiles ? 1 : 0);
     w("triggerFlashCheck", g_config.triggerFlashCheck ? 1 : 0);
     w("triggerSmokeCheck", g_config.triggerSmokeCheck ? 1 : 0);
@@ -315,6 +320,7 @@ void SaveConfig() {
     w("hitmarker", g_config.hitmarker ? 1 : 0);
     w("bombTimer", g_config.bombTimer ? 1 : 0);
     w("thirdPerson", g_config.thirdPerson ? 1 : 0);
+    w("thirdPersonToggle", g_config.thirdPersonToggle ? 1 : 0);
     w("thirdPersonKey", g_config.thirdPersonKey);
     w("thirdPersonDist", g_config.thirdPersonDist);
     w("entityCacheLite", g_config.entityCacheLite ? 1 : 0);
@@ -378,6 +384,8 @@ void LoadConfig() {
             else if (k == "triggerRcs") g_config.triggerRcs = std::stoi(v) != 0;
             else if (k == "triggerRcsStrength") g_config.triggerRcsStrength = std::stof(v);
             else if (k == "triggerBoneFov") g_config.triggerBoneFov = std::stof(v);
+            else if (k == "triggerHitchance") g_config.triggerHitchance = std::stoi(v) != 0;
+            else if (k == "triggerHitchanceMin") g_config.triggerHitchanceMin = std::stof(v);
             else if (k == "triggerWeaponProfiles") g_config.triggerWeaponProfiles = std::stoi(v) != 0;
             else if (k == "triggerFlashCheck") g_config.triggerFlashCheck = std::stoi(v) != 0;
             else if (k == "triggerSmokeCheck") g_config.triggerSmokeCheck = std::stoi(v) != 0;
@@ -412,6 +420,7 @@ void LoadConfig() {
             else if (k == "hitmarker") g_config.hitmarker = std::stoi(v) != 0;
             else if (k == "bombTimer") g_config.bombTimer = std::stoi(v) != 0;
             else if (k == "thirdPerson") g_config.thirdPerson = std::stoi(v) != 0;
+            else if (k == "thirdPersonToggle") g_config.thirdPersonToggle = std::stoi(v) != 0;
             else if (k == "thirdPersonKey") g_config.thirdPersonKey = std::stoi(v);
             else if (k == "thirdPersonDist") g_config.thirdPersonDist = std::stof(v);
             else if (k == "entityCacheLite") g_config.entityCacheLite = std::stoi(v) != 0;
@@ -1003,30 +1012,58 @@ static void SetThirdPersonResetPatch(bool enable) {
 }
 
 void DoThirdPerson(uintptr_t localPawn) {
-    // Original engine path (NOT OverrideView / guessed CViewSetup):
-    //   1) ThirdPersonReset JE->JMP while held (only if exact 0x75 found)
-    //   2) CSGOInput +0x229 thirdperson flag
+    // Engine path (stable):
+    //   1) ThirdPersonReset JE->JMP while active (pattern, only if 0x75 found)
+    //   2) CSGOInput thirdperson flag at +0x229 (pattern ptr or dwCSGOInput)
+    // Modes: hold key (default) or toggle on key edge
+    static bool toggledOn = false;
+    static bool keyWasDown = false;
+
     if (!g_running || !g_config.thirdPerson || !IsValid(localPawn) || !IsAlive(localPawn) || !hClient) {
         SetThirdPersonResetPatch(false);
+        toggledOn = false;
+        keyWasDown = false;
+        // Force flag off when disabled
+        uintptr_t inputOff = 0;
+        if (Pat::g_res.csgoInputPtr)
+            inputOff = Pat::ReadPtr(Pat::g_res.csgoInputPtr);
+        if (!IsValid(inputOff) && hClient)
+            inputOff = SafeRead<uintptr_t>(hClient + O::dwCSGOInput, 0);
+        if (IsValid(inputOff)) {
+            __try { SafeWrite<uint8_t>(inputOff + 0x229, 0); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
         return;
     }
 
-    bool hold = (g_config.thirdPersonKey != 0) && IsKeyDown(g_config.thirdPersonKey);
+    bool keyDown = (g_config.thirdPersonKey != 0) && IsKeyDown(g_config.thirdPersonKey);
+    bool active = false;
+    if (g_config.thirdPersonToggle) {
+        if (keyDown && !keyWasDown)
+            toggledOn = !toggledOn;
+        keyWasDown = keyDown;
+        active = toggledOn;
+    } else {
+        toggledOn = false;
+        keyWasDown = keyDown;
+        active = keyDown;
+    }
 
     if (Pat::g_res.thirdPersonReset)
-        SetThirdPersonResetPatch(hold);
+        SetThirdPersonResetPatch(active);
     else
         SetThirdPersonResetPatch(false);
 
     uintptr_t input = 0;
     if (Pat::g_res.csgoInputPtr)
         input = Pat::ReadPtr(Pat::g_res.csgoInputPtr);
+    if (!IsValid(input) && hClient)
+        input = SafeRead<uintptr_t>(hClient + O::dwCSGOInput, 0);
     if (!IsValid(input)) return;
     __try {
-        SafeWrite<uint8_t>(input + 0x229, hold ? 1 : 0);
+        SafeWrite<uint8_t>(input + 0x229, active ? 1 : 0);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
-
 
 void DoNoFlash(uintptr_t p) {
 
@@ -1160,6 +1197,98 @@ static void TriggerApplyRcsToBone(uintptr_t localPawn, const Vector3& bonePos) {
     // intentionally empty — trigger only presses attack
 }
 
+// Estimated hitchance 0–100 using weapon accuracy + movement + distance + bone FOV.
+// Not engine seed sim — practical gate so trigger only fires when the shot is likely.
+static float g_lastTriggerHC = 0.f;
+
+static float CalcTriggerHitchance(uintptr_t localPawn, uintptr_t target, const Vector3& bonePos,
+                                  float distPx, float maxFovPx) {
+    if (!IsValid(localPawn) || !IsValid(target)) return 0.f;
+
+    Vector3 eye = GetOrigin(localPawn);
+    eye.z += GetViewOffset(localPawn).z;
+    float dx = bonePos.x - eye.x, dy = bonePos.y - eye.y, dz = bonePos.z - eye.z;
+    float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (dist < 1.f) dist = 1.f;
+
+    // Weapon accuracy penalty (higher = worse)
+    float inacc = 0.f;
+    float turnInacc = 0.f;
+    uintptr_t wep = GetActiveWeapon(localPawn);
+    if (IsValid(wep)) {
+        inacc = SafeRead<float>(wep + O::m_fAccuracyPenalty, 0.f);
+        if (inacc < 0.f) inacc = 0.f;
+        // turning inaccuracy lives on weapon in current schema
+        turnInacc = SafeRead<float>(wep + O::m_flTurningInaccuracy, 0.f);
+        if (turnInacc < 0.f) turnInacc = 0.f;
+    }
+    float totalInacc = inacc + turnInacc * 0.85f;
+
+    // Local movement (units/s)
+    Vector3 vel = SafeRead<Vector3>(localPawn + O::m_vecVelocity, Vector3{});
+    float speed = sqrtf(vel.x * vel.x + vel.y * vel.y);
+    Vector3 tvel = SafeRead<Vector3>(target + O::m_vecVelocity, Vector3{});
+    float tspeed = sqrtf(tvel.x * tvel.x + tvel.y * tvel.y);
+
+    bool scoped = SafeRead<uint8_t>(localPawn + O::m_bIsScoped, 0) != 0;
+    int shots = SafeRead<int>(localPawn + O::m_iShotsFired, 0);
+    uint32_t flags = SafeRead<uint32_t>(localPawn + O::m_fFlags, 0);
+    bool ducked = (flags & O::FL_DUCKING) != 0;
+    bool onGround = (flags & O::FL_ONGROUND) != 0;
+
+    // Bone size heuristic (world units radius)
+    float boneR = 4.5f; // head-ish
+    switch (g_config.triggerBone) {
+    case 1: boneR = 5.5f; break; // neck
+    case 2: boneR = 8.0f; break; // chest
+    default: boneR = 4.2f; break;
+    }
+
+    // Spread cone radius at distance (scaled accuracy penalty)
+    // accuracy penalty is roughly in radians-ish scale; clamp for stability
+    float spreadRad = totalInacc * 0.55f + 0.0015f;
+    if (!onGround) spreadRad += 0.02f;
+    if (speed > 30.f) spreadRad += (speed / 250.f) * 0.025f;
+    if (shots > 1) spreadRad += shots * 0.0035f;
+    if (scoped) spreadRad *= 0.35f;
+    if (ducked) spreadRad *= 0.75f;
+
+    float coneR = tanf(spreadRad) * dist;
+    if (coneR < 0.5f) coneR = 0.5f;
+
+    // Geometric HC: bone area vs cone area (clamped)
+    float areaRatio = (boneR * boneR) / (coneR * coneR);
+    if (areaRatio > 1.f) areaRatio = 1.f;
+    float hc = areaRatio * 100.f;
+
+    // Crosshair-to-bone: farther from center inside FOV → lower HC
+    if (maxFovPx > 1.f) {
+        float fovFactor = 1.f - (distPx / maxFovPx) * 0.45f;
+        if (fovFactor < 0.35f) fovFactor = 0.35f;
+        hc *= fovFactor;
+    }
+
+    // Target strafe penalty
+    if (tspeed > 50.f) {
+        float tp = 1.f - (tspeed / 300.f) * 0.25f;
+        if (tp < 0.6f) tp = 0.6f;
+        hc *= tp;
+    }
+
+    // Distance soft falloff past ~25m
+    float distM = dist * 0.01905f;
+    if (distM > 25.f) {
+        float df = 1.f - (distM - 25.f) / 80.f;
+        if (df < 0.4f) df = 0.4f;
+        hc *= df;
+    }
+
+    if (hc < 0.f) hc = 0.f;
+    if (hc > 99.f) hc = 99.f;
+    g_lastTriggerHC = hc;
+    return hc;
+}
+
 void DoTriggerbot(uintptr_t localPawn, int localTeam) {
     // ---- State machine (no threads) ----
     static bool     attackHeld = false;
@@ -1247,6 +1376,17 @@ void DoTriggerbot(uintptr_t localPawn, int localTeam) {
     if (maxFov < 1.f) maxFov = g_TriggerFovPx;
     if (maxFov < 1.f) maxFov = 12.f;
     if (distPx > maxFov) return; // not on the bone → don't shoot
+
+    // ---- Hitchance gate ----
+    if (g_config.triggerHitchance) {
+        float hc = CalcTriggerHitchance(localPawn, target, bonePos, distPx, maxFov);
+        float need = g_config.triggerHitchanceMin;
+        if (need < 1.f) need = 1.f;
+        if (need > 99.f) need = 99.f;
+        if (hc < need) return;
+    } else {
+        g_lastTriggerHC = 100.f;
+    }
 
     // ---- Anti-recoil: aim through punch so bullet hits the bone ----
     if (g_config.triggerRcs)
@@ -2305,6 +2445,11 @@ void DrawMenu() {
         const char* tbones[] = { "Head", "Neck", "Chest" };
         ImGui::Combo("Bone (only fire on)", &g_config.triggerBone, tbones, 3);
         ImGui::SliderFloat("Bone FOV (px)", &g_config.triggerBoneFov, 3.f, 40.f, "%.0f");
+        ImGui::Checkbox("Hitchance", &g_config.triggerHitchance);
+        if (g_config.triggerHitchance) {
+            ImGui::SliderFloat("Min hitchance %", &g_config.triggerHitchanceMin, 10.f, 95.f, "%.0f");
+            ImGui::TextDisabled("Last HC: %.0f%%  (accuracy + move + dist + FOV)", g_lastTriggerHC);
+        }
         ImGui::TextDisabled("Only shoots when that bone is under the crosshair.");
 
         ImGui::SliderInt("Delay min (ms)", &g_config.triggerDelayMin, 20, 250);
@@ -2378,13 +2523,14 @@ void DrawMenu() {
         ImGui::Checkbox("Bomb world ESP", &g_config.bombEsp);
         ImGui::Checkbox("Nade prediction", &g_config.nadePred);
         SectionHeader("ENVIRONMENT");
-        ImGui::Checkbox("Environment grade", &g_config.envEnabled);
+        ImGui::Checkbox("Environment changer", &g_config.envEnabled);
         if (g_config.envEnabled) {
             const char* presets[] = { "Custom", "Night", "Warm", "Cold", "Dark", "Bright" };
             if (g_config.envPreset < 0 || g_config.envPreset > 5) g_config.envPreset = 1;
             ImGui::Combo("Preset", &g_config.envPreset, presets, 6);
-            ImGui::SliderFloat("Strength", &g_config.envStrength, 0.05f, 0.85f, "%.2f");
-            ImGui::TextDisabled("Writes C_EnvSky tint + brightness (env_sky entities).");
+            ImGui::SliderFloat("Strength", &g_config.envStrength, 0.05f, 1.f, "%.2f");
+            ImGui::TextDisabled("C_EnvSky tint + fog_controller + post process exposure");
+            ImGui::TextDisabled("(schema offsets, cached entity scan).");
         }
         if (g_config.nadePred)
             ImGui::SliderInt("Nade steps", &g_config.nadePredSteps, 15, 80);
@@ -2392,8 +2538,9 @@ void DrawMenu() {
 
         SectionHeader("THIRD PERSON");
         ImGui::Checkbox("Enable third person", &g_config.thirdPerson);
-        ImGui::TextDisabled("TP distance is unused on the engine path (kept for config compatibility).");
-        ImGui::TextDisabled("Hold key for engine third person (CSGOInput + ThirdPersonReset).");
+        ImGui::Checkbox("Toggle mode (else hold)", &g_config.thirdPersonToggle);
+        ImGui::TextDisabled("Engine path: CSGOInput +0x229 + ThirdPersonReset pattern.");
+        ImGui::TextDisabled("Hold key, or toggle on key press if toggle mode is on.");
         {
             static bool bindTp = false;
             ImGui::Text("Hold key:");
@@ -2486,11 +2633,30 @@ void DrawMenu() {
 // -------------------- WATERMARK / FOV / BOMB ESP / NADE / SNIPER CH --------------------
 
 
-// C_EnvSky (client schema)
+// -------------------- ENVIRONMENT CHANGER (schema offsets) --------------------
+// C_EnvSky — client_dll schema build 14178
 namespace EnvSky {
-    constexpr uintptr_t m_vTintColor = 0xFC1;             // Color RGBA bytes
-    constexpr uintptr_t m_vTintColorLightingOnly = 0xFC5;
-    constexpr uintptr_t m_flBrightnessScale = 0xFCC;      // float
+    constexpr std::ptrdiff_t m_vTintColor = 0xFC1;
+    constexpr std::ptrdiff_t m_vTintColorLightingOnly = 0xFC5;
+    constexpr std::ptrdiff_t m_flBrightnessScale = 0xFCC;
+}
+// C_FogController::m_fog (fogparams_t)
+namespace EnvFog {
+    constexpr std::ptrdiff_t m_fog = 0x600;
+    constexpr std::ptrdiff_t colorPrimary = 0x14;   // relative to m_fog
+    constexpr std::ptrdiff_t colorSecondary = 0x18;
+    constexpr std::ptrdiff_t start = 0x24;
+    constexpr std::ptrdiff_t end = 0x28;
+    constexpr std::ptrdiff_t maxdensity = 0x30;
+    constexpr std::ptrdiff_t HDRColorScale = 0x38;
+    constexpr std::ptrdiff_t enable = 0x64;
+}
+// C_PostProcessingVolume exposure
+namespace EnvPP {
+    constexpr std::ptrdiff_t m_flMinExposure = 0x10BC;
+    constexpr std::ptrdiff_t m_flMaxExposure = 0x10C0;
+    constexpr std::ptrdiff_t m_flExposureCompensation = 0x10C4;
+    constexpr std::ptrdiff_t m_bExposureControl = 0x10D5;
 }
 
 static void WriteSkyTint(uintptr_t sky, uint8_t r, uint8_t g, uint8_t b, uint8_t a, float brightness) {
@@ -2504,44 +2670,127 @@ static void WriteSkyTint(uintptr_t sky, uint8_t r, uint8_t g, uint8_t b, uint8_t
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
-void DoEnvironmentSky() {
-    if (!g_config.envEnabled || !g_pES || !IsInGame()) return;
-    static int tick = 0;
-    if ((++tick % 20) != 0) return; // no need every frame
+static void WriteFogTint(uintptr_t fogEnt, uint8_t r, uint8_t g, uint8_t b, float density, float startD, float endD) {
+    if (!IsValid(fogEnt)) return;
+    __try {
+        uintptr_t fog = fogEnt + EnvFog::m_fog;
+        uint8_t* cp = (uint8_t*)(fog + EnvFog::colorPrimary);
+        uint8_t* cs = (uint8_t*)(fog + EnvFog::colorSecondary);
+        cp[0] = r; cp[1] = g; cp[2] = b; cp[3] = 255;
+        cs[0] = r; cs[1] = g; cs[2] = b; cs[3] = 255;
+        *(float*)(fog + EnvFog::start) = startD;
+        *(float*)(fog + EnvFog::end) = endD;
+        *(float*)(fog + EnvFog::maxdensity) = density;
+        *(float*)(fog + EnvFog::HDRColorScale) = 1.f;
+        *(uint8_t*)(fog + EnvFog::enable) = 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
 
-    uint8_t r = 255, g = 255, b = 255, a = 255;
-    float bright = 1.f;
-    float s = g_config.envStrength;
-    if (s < 0.05f) s = 0.05f;
-    if (s > 1.f) s = 1.f;
-    switch (g_config.envPreset) {
-    case 1: // Night
-        r = (uint8_t)(30 + 40 * (1.f - s)); g = (uint8_t)(40 + 40 * (1.f - s)); b = (uint8_t)(80 + 50 * (1.f - s));
-        bright = 1.f - 0.7f * s; break;
-    case 2: // Warm
-        r = 255; g = (uint8_t)(180 - 60 * s); b = (uint8_t)(120 - 80 * s); bright = 1.f; break;
-    case 3: // Cold
-        r = (uint8_t)(120 - 40 * s); g = (uint8_t)(160 - 20 * s); b = 255; bright = 1.f; break;
-    case 4: // Dark
-        r = g = b = (uint8_t)(255 * (1.f - 0.85f * s)); bright = 1.f - 0.8f * s; break;
-    case 5: // Bright
-        r = g = b = 255; bright = 1.f + 1.5f * s; break;
-    default:
-        return;
-    }
+static void WritePPExposure(uintptr_t vol, float minE, float maxE, float comp) {
+    if (!IsValid(vol)) return;
+    __try {
+        *(float*)(vol + EnvPP::m_flMinExposure) = minE;
+        *(float*)(vol + EnvPP::m_flMaxExposure) = maxE;
+        *(float*)(vol + EnvPP::m_flExposureCompensation) = comp;
+        *(uint8_t*)(vol + EnvPP::m_bExposureControl) = 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
 
+// Cached environment entity handles — avoid full entity scans every call
+static uintptr_t g_envSky[8] = {};
+static int g_envSkyCount = 0;
+static uintptr_t g_envFog[4] = {};
+static int g_envFogCount = 0;
+static uintptr_t g_envPP[4] = {};
+static int g_envPPCount = 0;
+static int g_envCacheTick = 0;
+
+static void RefreshEnvEntityCache() {
+    g_envSkyCount = g_envFogCount = g_envPPCount = 0;
+    if (!g_pES || !IsValid(g_pES)) return;
     int highest = SafeRead<int>(g_pES + O::dwGameEntitySystem_highestEntityIndex, 512);
+    if (highest < 64) highest = 512;
     if (highest > 2048) highest = 2048;
     for (int i = 64; i <= highest; i++) {
         uintptr_t id = GetIdentityPtr(i);
         if (!IsValid(id)) continue;
-        if (!DesignerNameEquals(id, "env_sky")) continue;
         uintptr_t ent = SafeRead<uintptr_t>(id, 0);
         if (!IsValid(ent)) continue;
-        WriteSkyTint(ent, r, g, b, a, bright);
+        if (DesignerNameEquals(id, "env_sky")) {
+            if (g_envSkyCount < 8) g_envSky[g_envSkyCount++] = ent;
+        } else if (DesignerNameEquals(id, "fog_controller") || DesignerNameEquals(id, "env_fog_controller")) {
+            if (g_envFogCount < 4) g_envFog[g_envFogCount++] = ent;
+        } else if (DesignerNameEquals(id, "post_processing_volume") || DesignerNameEquals(id, "env_post_processing")) {
+            if (g_envPPCount < 4) g_envPP[g_envPPCount++] = ent;
+        }
+        if (g_envSkyCount >= 8 && g_envFogCount >= 4 && g_envPPCount >= 4) break;
     }
 }
 
+void DoEnvironmentSky() {
+    if (!g_config.envEnabled || !g_pES || !IsInGame()) return;
+
+    // Refresh entity cache every ~2s (or first run)
+    if ((++g_envCacheTick % 128) == 1 || (g_envSkyCount + g_envFogCount + g_envPPCount) == 0)
+        RefreshEnvEntityCache();
+
+    // Apply tint every ~8 frames (cheap writes)
+    static int applyTick = 0;
+    if ((++applyTick % 8) != 0) return;
+
+    uint8_t r = 255, g = 255, b = 255, a = 255;
+    float bright = 1.f;
+    float fogDensity = 0.f;
+    float fogStart = 500.f, fogEnd = 4000.f;
+    float expMin = 0.2f, expMax = 2.f, expComp = 0.f;
+    float s = g_config.envStrength;
+    if (s < 0.05f) s = 0.05f;
+    if (s > 1.f) s = 1.f;
+
+    switch (g_config.envPreset) {
+    case 1: // Night
+        r = (uint8_t)(20 + 30 * (1.f - s)); g = (uint8_t)(30 + 40 * (1.f - s)); b = (uint8_t)(70 + 50 * (1.f - s));
+        bright = 1.f - 0.75f * s;
+        fogDensity = 0.35f * s; fogStart = 200.f; fogEnd = 2500.f;
+        expMin = 0.05f; expMax = 0.6f; expComp = -0.4f * s;
+        break;
+    case 2: // Warm
+        r = 255; g = (uint8_t)(170 - 50 * s); b = (uint8_t)(110 - 70 * s);
+        bright = 1.f + 0.15f * s;
+        fogDensity = 0.12f * s; fogStart = 400.f; fogEnd = 3500.f;
+        expMin = 0.25f; expMax = 1.8f; expComp = 0.15f * s;
+        break;
+    case 3: // Cold
+        r = (uint8_t)(110 - 40 * s); g = (uint8_t)(150 - 20 * s); b = 255;
+        bright = 1.f;
+        fogDensity = 0.2f * s; fogStart = 300.f; fogEnd = 3000.f;
+        expMin = 0.15f; expMax = 1.4f; expComp = -0.1f * s;
+        break;
+    case 4: // Dark
+        r = g = b = (uint8_t)(255 * (1.f - 0.9f * s));
+        bright = 1.f - 0.85f * s;
+        fogDensity = 0.5f * s; fogStart = 100.f; fogEnd = 1800.f;
+        expMin = 0.02f; expMax = 0.4f; expComp = -0.6f * s;
+        break;
+    case 5: // Bright
+        r = g = b = 255;
+        bright = 1.f + 1.8f * s;
+        fogDensity = 0.f;
+        expMin = 0.5f; expMax = 3.f; expComp = 0.5f * s;
+        break;
+    default: // Custom = mild neutral boost
+        r = g = b = 255;
+        bright = 1.f + 0.3f * s;
+        break;
+    }
+
+    for (int i = 0; i < g_envSkyCount; i++)
+        WriteSkyTint(g_envSky[i], r, g, b, a, bright);
+    for (int i = 0; i < g_envFogCount; i++)
+        WriteFogTint(g_envFog[i], r, g, b, fogDensity, fogStart, fogEnd);
+    for (int i = 0; i < g_envPPCount; i++)
+        WritePPExposure(g_envPP[i], expMin, expMax, expComp);
+}
 
 void DrawEnvironmentGrade_UNUSED(ImDrawList* dl) {
     if (!g_config.envEnabled || !dl) return;

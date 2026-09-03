@@ -53,6 +53,7 @@ namespace O {
     constexpr std::ptrdiff_t m_iShotsFired = 0x1C8C;
     constexpr std::ptrdiff_t m_flVelocityModifier = 0x1C94;
     // C_CSWeaponBase
+    constexpr std::ptrdiff_t m_flTurningInaccuracy = 0x17EC;
     constexpr std::ptrdiff_t m_fAccuracyPenalty = 0x17F0;
     constexpr std::ptrdiff_t m_ArmorValue = 0x1CA4;
     constexpr std::ptrdiff_t m_entitySpottedState = 0x1C60;
